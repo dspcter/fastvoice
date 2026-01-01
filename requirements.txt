@@ -1,0 +1,28 @@
+# 快人快语 (FastVoice) - 依赖包列表
+
+# 核心依赖
+pynput>=1.7.6                    # 全局快捷键监听 (跨平台)
+sounddevice>=0.4.6               # 音频采集
+webrtcvad>=2.0.10                # 语音活动检测 (VAD)
+pyautogui>=0.9.54                # 模拟键盘输入 (跨平台)
+pyperclip>=1.8.2                 # 剪贴板操作
+
+# AI 模型相关
+onnxruntime>=1.16.0              # ONNX 推理引擎
+sherpa-onnx>=1.10.0              # 语音识别框架
+transformers>=4.36.0             # 千问翻译模型
+torch>=2.1.0                     # PyTorch (翻译模型依赖)
+huggingface-hub>=0.19.0          # 模型下载管理
+
+# 界面相关
+PyQt6>=6.6.0                     # 设置界面
+PyQt6-Qt6>=6.6.0                 # Qt6 核心
+PyQt6-sip>=13.6.0                # SIP 绑定
+
+# 配置和工具
+pyyaml>=6.0.1                    # 配置文件解析
+requests>=2.31.0                 # HTTP 请求
+cn2an>=0.5.0                     # 中文数字转换
+
+# 打包工具
+PyInstaller>=6.3.0               # 打包成可执行文件

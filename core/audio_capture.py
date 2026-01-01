@@ -1,0 +1,417 @@
+# core/audio_capture.py
+# 音频采集模块 (含 VAD)
+
+import array
+import logging
+import queue
+import threading
+import time
+import wave
+import webrtcvad
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Tuple
+
+import sounddevice as sd
+import numpy as np
+
+from config import AUDIO_DIR
+
+logger = logging.getLogger(__name__)
+
+
+class AudioCapture:
+    """
+    音频采集类
+
+    功能:
+    - 麦克风音频采集
+    - WebRTC VAD 语音活动检测
+    - 音频数据保存
+    - 支持多麦克风设备
+    """
+
+    # VAD 参数
+    VAD_FRAME_DURATION_MS = 30  # 每帧时长 (毫秒)
+    VAD_AGGRESSIVENESS = 2      # 激进程度 (0-3)
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        channels: int = 1,
+        vad_threshold: int = 500,
+        device: Optional[str] = None,
+    ):
+        """
+        初始化音频采集器
+
+        Args:
+            sample_rate: 采样率 (默认 16000Hz)
+            channels: 声道数 (默认 1)
+            vad_threshold: VAD 静音阈值 (毫秒)
+            device: 麦克风设备名称
+        """
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.vad_threshold = vad_threshold
+
+        # 音频帧大小
+        self.frame_size = int(sample_rate * self.VAD_FRAME_DURATION_MS / 1000)
+
+        # VAD 检测器
+        self._vad = webrtcvad.Vad(self.VAD_AGGRESSIVENESS)
+
+        # 音频设备
+        self._device_info = self._get_device_info(device)
+        self._device_index = self._device_info["index"] if self._device_info else None
+
+        # 录音状态
+        self._is_recording = False
+        self._audio_queue = queue.Queue()
+        self._record_thread: Optional[threading.Thread] = None
+        self._stream: Optional[sd.InputStream] = None
+
+        # 音频数据缓冲
+        self._audio_buffer = []
+        self._silence_frames = 0
+        self._voice_detected = False
+
+        # 确保音频目录存在
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"音频采集器初始化完成 (设备: {self._device_info['name'] if self._device_info else '默认'})")
+
+    def _get_device_info(self, device_name: Optional[str]) -> Optional[dict]:
+        """
+        获取音频设备信息
+
+        Args:
+            device_name: 设备名称 (None 则使用默认设备)
+
+        Returns:
+            设备信息字典
+        """
+        try:
+            devices = sd.query_devices()
+
+            # 查找指定设备
+            if device_name:
+                for i, dev in enumerate(devices):
+                    if dev["name"] == device_name and dev["max_input_channels"] > 0:
+                        return {
+                            "index": i,
+                            "name": dev["name"],
+                            "channels": dev["max_input_channels"],
+                        }
+                logger.warning(f"未找到设备: {device_name}，使用默认设备")
+
+            # 使用默认输入设备
+            default_device = sd.query_devices(kind="input")
+            return {
+                "index": None,  # None 表示使用默认设备
+                "name": default_device["name"],
+                "channels": default_device["max_input_channels"],
+            }
+
+        except Exception as e:
+            logger.error(f"获取音频设备失败: {e}")
+            return None
+
+    @staticmethod
+    def list_devices() -> list:
+        """列出所有可用的音频输入设备"""
+        try:
+            devices = sd.query_devices()
+            input_devices = []
+
+            for i, dev in enumerate(devices):
+                if dev["max_input_channels"] > 0:
+                    input_devices.append({
+                        "index": i,
+                        "name": dev["name"],
+                        "channels": dev["max_input_channels"],
+                        "sample_rate": int(dev["default_samplerate"]),
+                    })
+
+            return input_devices
+
+        except Exception as e:
+            logger.error(f"获取设备列表失败: {e}")
+            return []
+
+    def start_recording(self) -> bool:
+        """
+        开始录音
+
+        Returns:
+            是否启动成功
+        """
+        if self._is_recording:
+            logger.warning("录音已在进行中")
+            return True
+
+        try:
+            # 重置缓冲
+            self._audio_buffer = []
+            self._silence_frames = 0
+            self._voice_detected = False
+
+            # 创建音频流
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                device=self._device_index,
+                dtype=np.int16,
+                callback=self._audio_callback,
+            )
+
+            self._stream.start()
+            self._is_recording = True
+
+            logger.info("开始录音")
+            return True
+
+        except Exception as e:
+            logger.error(f"启动录音失败: {e}")
+            return False
+
+    def stop_recording(self) -> Optional[bytes]:
+        """
+        停止录音并返回音频数据
+
+        Returns:
+            WAV 格式音频数据 (bytes)
+        """
+        if not self._is_recording:
+            return None
+
+        try:
+            # 停止音频流
+            if self._stream:
+                self._stream.stop()
+                self._stream.close()
+                self._stream = None
+
+            self._is_recording = False
+
+            # 合并音频数据
+            if not self._audio_buffer:
+                logger.warning("没有录制到音频数据")
+                return None
+
+            # 转换为 WAV 格式
+            wav_data = self._convert_to_wav(self._audio_buffer)
+
+            logger.info(f"停止录音，共 {len(self._audio_buffer)} 帧")
+            return wav_data
+
+        except Exception as e:
+            logger.error(f"停止录音失败: {e}")
+            return None
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        """
+        音频流回调函数
+
+        Args:
+            indata: 输入音频数据
+            frames: 帧数
+            time_info: 时间信息
+            status: 状态
+        """
+        if status:
+            logger.warning(f"音频流状态: {status}")
+
+        # 转换为 bytes
+        audio_bytes = indata.tobytes()
+
+        # 添加到队列（用于音量检测等）
+        self._audio_queue.put(audio_bytes)
+
+        # 直接添加到音频缓冲区
+        self._audio_buffer.append(audio_bytes)
+
+    def _convert_to_wav(self, audio_frames: list) -> bytes:
+        """
+        将音频帧转换为 WAV 格式
+
+        Args:
+            audio_frames: 音频帧列表
+
+        Returns:
+            WAV 格式音频数据
+        """
+        import io
+
+        # 创建内存缓冲区
+        buffer = io.BytesIO()
+
+        # 写入 WAV 文件
+        with wave.open(buffer, "wb") as wf:
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(2)  # 16-bit = 2 bytes
+            wf.setframerate(self.sample_rate)
+
+            # 写入音频数据
+            for frame in audio_frames:
+                wf.writeframes(frame)
+
+        return buffer.getvalue()
+
+    def save_audio(self, audio_data: bytes, filename: Optional[str] = None) -> Path:
+        """
+        保存音频到文件
+
+        Args:
+            audio_data: WAV 格式音频数据
+            filename: 文件名 (None 则自动生成)
+
+        Returns:
+            保存的文件路径
+        """
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"voice_{timestamp}.wav"
+
+        filepath = AUDIO_DIR / filename
+
+        try:
+            with open(filepath, "wb") as f:
+                f.write(audio_data)
+
+            logger.info(f"音频已保存: {filepath}")
+            return filepath
+
+        except Exception as e:
+            logger.error(f"保存音频失败: {e}")
+            raise
+
+    def is_recording(self) -> bool:
+        """是否正在录音"""
+        return self._is_recording
+
+    def get_audio_level(self) -> float:
+        """
+        获取当前音频音量等级
+
+        Returns:
+            音量等级 (0.0 - 1.0)
+        """
+        if not self._is_recording or self._audio_queue.empty():
+            return 0.0
+
+        try:
+            # 获取最新的音频帧
+            audio_bytes = self._audio_queue.get_nowait()
+
+            # 计算音量 (RMS)
+            samples = np.frombuffer(audio_bytes, dtype=np.int16)
+            rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+            level = min(rms / 32768, 1.0)
+
+            return level
+
+        except queue.Empty:
+            return 0.0
+
+    def detect_voice_activity(self, audio_bytes: bytes) -> bool:
+        """
+        检测音频中是否包含语音
+
+        Args:
+            audio_bytes: 音频数据 (必须为 frame_size 大小)
+
+        Returns:
+            是否包含语音
+        """
+        try:
+            # 确保数据长度正确
+            if len(audio_bytes) != self.frame_size * 2:  # 16-bit = 2 bytes
+                return False
+
+            # VAD 检测
+            is_speech = self._vad.is_speech(audio_bytes, self.sample_rate)
+
+            if is_speech:
+                self._voice_detected = True
+                self._silence_frames = 0
+            else:
+                self._silence_frames += 1
+
+            return is_speech
+
+        except Exception as e:
+            logger.error(f"VAD 检测失败: {e}")
+            return False
+
+    def should_stop_by_silence(self) -> bool:
+        """
+        检查是否应该因静音而停止录音
+
+        Returns:
+            是否应该停止
+        """
+        if not self._voice_detected:
+            # 还没有检测到语音，不停止
+            return False
+
+        # 计算静音时长
+        silence_duration = self._silence_frames * self.VAD_FRAME_DURATION_MS
+
+        return silence_duration >= self.vad_threshold
+
+
+# ==================== 使用示例 ====================
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    # 列出可用设备
+    print("可用音频设备:")
+    devices = AudioCapture.list_devices()
+    for dev in devices:
+        print(f"  [{dev['index']}] {dev['name']}")
+
+    # 创建音频采集器
+    capture = AudioCapture(
+        sample_rate=16000,
+        vad_threshold=500,
+    )
+
+    print("\n按回车开始录音，再按回车停止...")
+
+    # 等待用户输入
+    input()
+
+    # 开始录音
+    if capture.start_recording():
+        print("录音中...")
+
+        # 实时显示音量
+        import time
+        start_time = time.time()
+
+        while capture.is_recording():
+            level = capture.get_audio_level()
+            elapsed = time.time() - start_time
+            print(f"\r音量: [{level*100:6.2f}%] 时长: {elapsed:.1f}s", end="")
+
+            # 检查是否应该停止（用户按回车）
+            if capture._audio_queue.qsize() > 100:  # 模拟用户输入
+                break
+
+            time.sleep(0.1)
+
+        # 停止录音
+        audio_data = capture.stop_recording()
+
+        if audio_data:
+            # 保存音频
+            filepath = capture.save_audio(audio_data)
+            print(f"\n音频已保存到: {filepath}")
+            print(f"文件大小: {len(audio_data)} bytes")
+        else:
+            print("\n没有录制到音频")
