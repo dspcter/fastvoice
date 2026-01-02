@@ -275,22 +275,33 @@ class HotkeyManager:
             # 将按键转换为字符串表示
             key_str = self._key_to_string(key)
 
+            # 添加调试日志
+            logger.info(f"[DEBUG] 按键释放: {key_str}, 语音激活: {self._voice_input_active}, 翻译激活: {self._translate_active}")
+
             # 从已按下集合移除
             self._pressed_keys.discard(key_str)
 
             # 检查语音输入快捷键释放
             voice_keys = self._hotkeys.get("voice_input", set())
             if voice_keys and key_str in voice_keys:
+                logger.info(f"[DEBUG] 检测到语音输入快捷键释放: {key_str} in {voice_keys}, 激活状态: {self._voice_input_active}")
                 if self._voice_input_active:
                     self._voice_input_active = False
+                    logger.info("触发语音输入释放回调")
                     self._trigger_callback(HotkeyAction.VOICE_INPUT_RELEASE)
+                else:
+                    logger.warning(f"语音输入快捷键 {key_str} 释放，但 _voice_input_active 为 False")
 
             # 检查翻译快捷键释放
             translate_keys = self._hotkeys.get("quick_translate", set())
             if translate_keys and key_str in translate_keys:
+                logger.info(f"[DEBUG] 检测到翻译快捷键释放: {key_str} in {translate_keys}, 激活状态: {self._translate_active}")
                 if self._translate_active:
                     self._translate_active = False
+                    logger.info("触发翻译释放回调")
                     self._trigger_callback(HotkeyAction.QUICK_TRANSLATE_RELEASE)
+                else:
+                    logger.warning(f"翻译快捷键 {key_str} 释放，但 _translate_active 为 False")
 
         except Exception as e:
             logger.error(f"处理按键释放事件失败: {e}")

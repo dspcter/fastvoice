@@ -1,5 +1,5 @@
 # core/text_postprocessor.py
-# 文本后处理模块：去除语气词、添加标点、逻辑梳理（增强规则版本）
+# 文本后处理模块 - 基于 pangu.py 设计理念
 
 import logging
 import re
@@ -7,155 +7,21 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ==================== CJK 字符定义（参考 pangu.py）====================
+CJK = r'\u2e80-\u2eff\u2f00-\u2fdf\u3040-\u309f\u30a0-\u30fa\u30fc-\u30ff\u3100-\u312f\u3200-\u32ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
+ANY_CJK = re.compile(r'[{CJK}]'.format(CJK=CJK))
+
 
 class TextPostProcessor:
     """
-    文本后处理器 - 增强规则版本
+    文本后处理器 - 基于 pangu.py 设计理念的完全重写版本
 
-    功能：
-    - 去除语气词
-    - 智能添加标点符号
-    - 处理并列关系、复句等
-    - 长句分段
+    核心理念：
+    1. 使用 CJK 字符的完整 Unicode 范围
+    2. 精心设计的正则表达式序列处理各种边界
+    3. 按顺序应用规则，避免规则冲突
+    4. 保留语音识别特有的处理逻辑
     """
-
-    # ==================== 语气词和填充词 ====================
-    # 句首填充词（只删除明确的语气词，不删除"这个"/"那个"）
-    SENTENCE_INITIAL_FILLERS = [
-        r'^嗯嗯\s*', r'^啊啊\s*', r'^呃呃\s*', r'^额额\s*',
-        r'^那个那个\s*', r'^这个这个\s*',
-    ]
-
-    # 句尾语气词（删除但不影响标点判断）
-    SENTENCE_FINAL_FILLERS = [r'啊$', r'呀$', r'哦$']
-
-    # ==================== 语气词规则（参考 GB/T 15834-2011）====================
-    # 句末语气词（用于标点判断）
-    SENTENCE_FINAL_PARTICLES = ['啊', '呀', '哦', '呢', '吧', '嘛', '啦']
-
-    # 确认/应答语气词（后加逗号）
-    CONFIRMATION_WORDS = [
-        '好的', '对的', '是的', '没问题', '不错', '行',
-        '好的好的', '对', '嗯', '噢', '诶', '喔',
-    ]
-
-    # ==================== 终止符集合（参考 sentence_segmenter）====================
-    TERMINATORS = {'。', '！', '"', '…', '?', '!', '"', '？'}
-
-    # ==================== 标点规则 ====================
-    # 疑问句关键词
-    QUESTION_MARKERS = [
-        '什么', '怎么', '为什么', '哪里', '哪儿', '哪', '吗',
-        '呢', '是不是', '对不对', '好不好', '行不行',
-    ]
-
-    # 感叹句关键词
-    EXCLAMATION_MARKERS = [
-        '真', '太', '超级', '非常', '特别', '相当', '极其',
-    ]
-
-    # ==================== 逗号规则（复句处理 - 参考复句关联词研究） ====================
-    # 因果复句：因为...所以...、由于...因此...
-    CAUSAL_BEFORE = ['因为', '由于', '既然']
-    CAUSAL_AFTER = ['所以', '因此', '因而', '故而']
-
-    # 转折复句：虽然...但是...、尽管...可是...
-    ADVERSATIVE_BEFORE = ['虽然', '尽管', '固然']
-    ADVERSATIVE_AFTER = ['但是', '可是', '然而', '不过', '但']
-
-    # 假设复句：如果...就/那么...、假如...则...
-    CONDITIONAL_BEFORE = ['如果', '假如', '要是', '倘若', '若是']
-    CONDITIONAL_AFTER = ['就', '便', '则', '那么', '那']
-
-    # 递进复句：不但...而且...、不仅...还...
-    PROGRESSIVE_BEFORE = ['不但', '不仅', '不光', '不只']
-    PROGRESSIVE_AFTER = ['而且', '还', '并且', '也', '又']
-
-    # 需要在前面加逗号的连接词（综合列表）
-    COMMA_BEFORE_WORDS = [
-        '但是', '可是', '不过', '所以', '因此', '然后', '接着', '之后',
-        '然而', '而且', '并且', '另外', '此外', '同时', '于是',
-    ]
-
-    # 需要在后面加逗号的连接词（综合列表）
-    COMMA_AFTER_WORDS = [
-        '因为', '如果', '虽然', '今天', '昨天', '明天',
-        '由于', '既然', '尽管', '假如', '要是',
-        '首先', '其次', '最后', '总之',
-    ]
-
-    # ==================== 英文优化规则 ====================
-    # 常见的英文缩写和专有名词（需要保持大小写）
-    ENGLISH_CAPITALIZATION = {
-        'api': 'API',
-        'sdk': 'SDK',
-        'ui': 'UI',
-        'ux': 'UX',
-        'ai': 'AI',
-        'ml': 'ML',
-        'nlp': 'NLP',
-        'llm': 'LLM',
-        'gpu': 'GPU',
-        'cpu': 'CPU',
-        'ram': 'RAM',
-        'sql': 'SQL',
-        'nosql': 'NoSQL',
-        'html': 'HTML',
-        'css': 'CSS',
-        'xml': 'XML',
-        'json': 'JSON',
-        'http': 'HTTP',
-        'https': 'HTTPS',
-        'tcp': 'TCP',
-        'udp': 'UDP',
-        'ip': 'IP',
-        'cdn': 'CDN',
-        'crm': 'CRM',
-        'erp': 'ERP',
-        'ceo': 'CEO',
-        'cto': 'CTO',
-        'cfo': 'CFO',
-        'kpi': 'KPI',
-        'ok': 'OK',
-        'ios': 'iOS',
-        'android': 'Android',
-        'linux': 'Linux',
-        'python': 'Python',
-        'java': 'Java',
-        'javascript': 'JavaScript',
-        'typescript': 'TypeScript',
-        'react': 'React',
-        'vue': 'Vue',
-        'angular': 'Angular',
-        'node': 'Node',
-        'docker': 'Docker',
-        'kubernetes': 'Kubernetes',
-        'aws': 'AWS',
-        'azure': 'Azure',
-        'google': 'Google',
-        'microsoft': 'Microsoft',
-        'apple': 'Apple',
-        'facebook': 'Facebook',
-        'twitter': 'Twitter',
-        'github': 'GitHub',
-        'gitlab': 'GitLab',
-        'mysql': 'MySQL',
-        'postgresql': 'PostgreSQL',
-        'mongodb': 'MongoDB',
-        'redis': 'Redis',
-        'nginx': 'Nginx',
-        'apache': 'Apache',
-    }
-
-    # ==================== 长句分段规则 ====================
-    # 句中分段标记（在这些词前分段）
-    SEGMENT_MARKERS = [
-        '另外', '此外', '还有', '再者', '同时',
-        '接下来', '然后', '之后', '后来',
-    ]
-
-    # 最大句子长度（超过此长度考虑分段）
-    MAX_SENTENCE_LENGTH = 30
 
     def __init__(self, enable_punctuation: bool = True, enable_filler_removal: bool = True):
         """
@@ -168,63 +34,180 @@ class TextPostProcessor:
         self.enable_punctuation = enable_punctuation
         self.enable_filler_removal = enable_filler_removal
 
-        # 预编译正则表达式
-        self._filler_patterns = [re.compile(p) for p in self.SENTENCE_INITIAL_FILLERS]
-        self._final_filler_patterns = [re.compile(p) for p in self.SENTENCE_FINAL_FILLERS]
+        # ==================== pangu.py 风格的正则表达式 ====================
+        # CJK 与英文/数字/符号的边界
+        self._cjk_ans = re.compile('([{CJK}])([A-Za-z0-9@\\$%\\^&\\*\\-\\+\\\\=\\|/])'.format(CJK=CJK))
+        self._ans_cjk = re.compile('([A-Za-z0-9~\\!\\$%\\^&\\*\\-\\+\\\\=\\|;:,\\./\\?])([{CJK}])'.format(CJK=CJK))
 
-        logger.info("文本后处理器初始化完成 (使用增强规则)")
+        # CJK 与操作符
+        self._cjk_operator_ans = re.compile('([{CJK}])([\\+\\-\\*\\/=&\\|<>])([A-Za-z0-9])'.format(CJK=CJK))
+        self._ans_operator_cjk = re.compile('([A-Za-z0-9])([\\+\\-\\*\\/=&\\|<>])([{CJK}])'.format(CJK=CJK))
 
-    def _fix_english_capitalization(self, text: str) -> str:
-        """修复英文大小写（不依赖空格）"""
-        result = text
+        # CJK 与括号
+        self._cjk_left_bracket = re.compile('([{CJK}])([\\(\\[\\{{<>\u201c])'.format(CJK=CJK))
+        self._right_bracket_cjk = re.compile('([\\)\\]\\}}<>\u201d])([{CJK}])'.format(CJK=CJK))
+        self._an_left_bracket = re.compile(r'([A-Za-z0-9])([\(\[\{])')
+        self._right_bracket_an = re.compile(r'([\)\]\}])([A-Za-z0-9])')
 
-        # 按长度降序处理，避免短词覆盖长词
-        sorted_words = sorted(self.ENGLISH_CAPITALIZATION.items(),
-                            key=lambda x: len(x[0]), reverse=True)
+        # CJK 与引号
+        self._cjk_quote = re.compile('([{CJK}])([`"\u05f4])'.format(CJK=CJK))
+        self._quote_cjk = re.compile('([`"\u05f4])([{CJK}])'.format(CJK=CJK))
 
-        for word_lower, word_correct in sorted_words:
-            # 直接替换，使用.IGNORECASE确保大小写不敏感
-            # 这会匹配到所有的变体：API, Api, api 等
-            pattern = re.escape(word_lower)
-            result = re.sub(pattern, word_correct, result, flags=re.IGNORECASE)
+        # ==================== 语音识别特有的处理 ====================
+        # 逐字母拼写修复（pangu.py 没有这个功能）
+        # 使用 lookaround 而不是 \b，因为 \b 在 CJK 字符前不工作
+        self._letter_spacing_pattern = re.compile(r'(?<![a-zA-Z])[a-z](?: [a-z]){1,5}(?![a-z])', re.IGNORECASE)
 
-        return result
+        # 英文大小写映射（2025年术语）
+        self._english_capitalization = self._build_english_terms()
 
-    def _fix_chinese_english_boundary(self, text: str) -> str:
-        """修复中英文边界（添加空格）"""
-        # 中文与英文字母/数字之间添加空格
-        # 模式：中文后面直接跟英文字母 → 添加空格
-        result = re.sub(r'([\u4e00-\u9fff])([a-zA-Z0-9])', r'\1 \2', text)
+        # ==================== 填充词处理 ====================
+        self._sentence_initial_fillers = [
+            re.compile(r'^嗯嗯\s*'), re.compile(r'^啊啊\s*'), re.compile(r'^呃呃\s*'),
+            re.compile(r'^那个那个\s*'), re.compile(r'^这个这个\s*'),
+        ]
+        self._sentence_final_fillers = [
+            re.compile(r'啊$'), re.compile(r'呀$'), re.compile(r'哦$'),
+        ]
 
-        # 模式：英文字母后面直接跟中文 → 添加空格
-        result = re.sub(r'([a-zA-Z0-9])([\u4e00-\u9fff])', r'\1 \2', result)
+        logger.info("文本后处理器初始化完成 (基于 pangu.py 设计)")
 
-        return result
+    def _build_english_terms(self) -> dict:
+        """构建英文术语字典"""
+        return {
+            # AI/ML (2025)
+            'ai': 'AI', 'ml': 'ML', 'nlp': 'NLP', 'llm': 'LLM',
+            'chatgpt': 'ChatGPT', 'gpt': 'GPT', 'claude': 'Claude',
+            'llama': 'LLaMA', 'mistral': 'Mistral', 'gemini': 'Gemini',
+            'rag': 'RAG', 'agi': 'AGI', 'transformer': 'Transformer',
+            'bert': 'BERT', 'langchain': 'LangChain', 'openai': 'OpenAI',
+            'huggingface': 'HuggingFace', 'cohere': 'Cohere', 'anthropic': 'Anthropic',
 
-    def _detect_english_ratio(self, text: str) -> float:
-        """检测文本中英文的比例"""
+            # 开发工具
+            'api': 'API', 'sdk': 'SDK', 'ui': 'UI', 'ux': 'UX',
+            'http': 'HTTP', 'https': 'HTTPS', 'tcp': 'TCP', 'udp': 'UDP',
+            'ssh': 'SSH', 'ssl': 'TLS', 'ftp': 'FTP', 'dns': 'DNS',
+            'url': 'URL', 'uri': 'URI', 'json': 'JSON', 'yaml': 'YAML',
+            'xml': 'XML', 'html': 'HTML', 'css': 'CSS', 'sql': 'SQL',
+            'markdown': 'Markdown', 'regex': 'Regex', 'rest': 'REST',
+            'graphql': 'GraphQL', 'grpc': 'gRPC', 'websocket': 'WebSocket',
+
+            # 编程语言
+            'python': 'Python', 'java': 'Java', 'javascript': 'JavaScript',
+            'typescript': 'TypeScript', 'golang': 'Golang', 'rust': 'Rust',
+            'cpp': 'C++', 'csharp': 'C#', 'php': 'PHP', 'swift': 'Swift',
+            'kotlin': 'Kotlin', 'scala': 'Scala', 'ruby': 'Ruby', 'go': 'Go',
+            'matlab': 'MATLAB', 'r': 'R', 'julia': 'Julia', 'lua': 'Lua',
+
+            # 框架和库
+            'react': 'React', 'vue': 'Vue', 'angular': 'Angular',
+            'django': 'Django', 'flask': 'Flask', 'fastapi': 'FastAPI',
+            'spring': 'Spring', 'express': 'Express', 'nest': 'Nest',
+            'nextjs': 'Next.js', 'nuxtjs': 'Nuxt.js', 'vite': 'Vite',
+            'webpack': 'Webpack', 'vite': 'Vite', 'babel': 'Babel',
+            'numpy': 'NumPy', 'pandas': 'Pandas', 'tensorflow': 'TensorFlow',
+            'pytorch': 'PyTorch', 'keras': 'Keras', 'scikit': 'Scikit',
+
+            # 云服务和工具
+            'docker': 'Docker', 'kubernetes': 'Kubernetes', 'k8s': 'K8s',
+            'aws': 'AWS', 'azure': 'Azure', 'gcp': 'GCP', 'aliyun': 'Aliyun',
+            'nginx': 'Nginx', 'apache': 'Apache', 'mysql': 'MySQL',
+            'mongodb': 'MongoDB', 'redis': 'Redis', 'postgresql': 'PostgreSQL',
+            'sqlite': 'SQLite', 'elasticsearch': 'Elasticsearch',
+            'git': 'Git', 'github': 'GitHub', 'gitlab': 'GitLab',
+            'bitbucket': 'Bitbucket', 'gitee': 'Gitee',
+            'jenkins': 'Jenkins', 'travis': 'Travis', 'circleci': 'CircleCI',
+            'terraform': 'Terraform', 'ansible': 'Ansible', 'puppet': 'Puppet',
+
+            # 系统和平台
+            'ios': 'iOS', 'android': 'Android', 'linux': 'Linux',
+            'windows': 'Windows', 'macos': 'macOS', 'ubuntu': 'Ubuntu',
+            'debian': 'Debian', 'centos': 'CentOS', 'redhat': 'RedHat',
+            'fedora': 'Fedora', 'arch': 'Arch', 'gentoo': 'Gentoo',
+            'unix': 'Unix', 'posix': 'POSIX', 'gnu': 'GNU',
+
+            # 开发平台
+            'vscode': 'VS Code', 'visualstudio': 'Visual Studio',
+            'xcode': 'Xcode', 'androidstudio': 'Android Studio',
+            'intellij': 'IntelliJ', 'pycharm': 'PyCharm', 'webstorm': 'WebStorm',
+            'sublime': 'Sublime', 'atom': 'Atom', 'vim': 'Vim', 'emacs': 'Emacs',
+
+            # 常见缩写
+            'ok': 'OK', 'cpu': 'CPU', 'gpu': 'GPU', 'ram': 'RAM',
+            'ssd': 'SSD', 'usb': 'USB', 'vpn': 'VPN', 'cdn': 'CDN',
+            'ceo': 'CEO', 'cto': 'CTO', 'cfo': 'CFO', 'coo': 'COO',
+            'kpi': 'KPI', 'roi': 'ROI', 'qa': 'QA', 'pm': 'PM',
+            'hr': 'HR', 'it': 'IT', 'r&d': 'R&D', 'b2b': 'B2B',
+            'b2c': 'B2C', 'o2o': 'O2O', 'saas': 'SaaS', 'paas': 'PaaS',
+            'iaas': 'IaaS', 'api': 'API', 'sdk': 'SDK', 'ide': 'IDE',
+
+            # 社交和媒体
+            'facebook': 'Facebook', 'twitter': 'Twitter', 'instagram': 'Instagram',
+            'linkedin': 'LinkedIn', 'youtube': 'YouTube', 'tiktok': 'TikTok',
+            'wechat': 'WeChat', 'telegram': 'Telegram', 'discord': 'Discord',
+            'slack': 'Slack', 'zoom': 'Zoom', 'teams': 'Teams',
+
+            # 其他常见词
+            'wifi': 'Wi-Fi', 'wi-fi': 'Wi-Fi', 'bluetooth': 'Bluetooth', 'nfc': 'NFC',
+            'qr': 'QR', 'pdf': 'PDF', 'csv': 'CSV', 'txt': 'TXT',
+            'email': 'email', 'ios': 'iOS', 'ipad': 'iPad', 'iphone': 'iPhone',
+        }
+
+    def process(self, text: str) -> str:
+        """
+        处理文本的主入口
+
+        处理流程（基于 pangu.py 理念）：
+        1. 去除填充词
+        2. 修复逐字母拼写
+        3. 转换中文数字
+        4. 应用 pangu 风格的空格规则
+        5. 修复英文大小写
+        6. 添加标点符号
+        """
         if not text:
-            return 0
+            return text
 
-        # 统计英文字母数（不包含空格）
-        english_chars = len(re.findall(r'[a-zA-Z]', text))
-        total_chars = len(text)
-
-        return english_chars / total_chars if total_chars > 0 else 0
-
-    def _remove_filler_words(self, text: str) -> str:
-        """去除语气词和填充词"""
-        if not self.enable_filler_removal:
+        # 预处理
+        text = text.strip()
+        if not text:
             return text
 
         result = text
 
+        # 步骤1: 去除填充词
+        if self.enable_filler_removal:
+            result = self._remove_fillers(result)
+
+        # 步骤2: 修复逐字母拼写（语音识别特有）
+        result = self._fix_letter_spelling(result)
+
+        # 步骤3: 转换中文数字
+        result = self._convert_chinese_numbers(result)
+
+        # 步骤4: 应用 pangu 风格的空格规则（核心）
+        result = self._apply_pangu_spacing(result)
+
+        # 步骤5: 修复英文大小写
+        result = self._fix_english_capitalization(result)
+
+        # 步骤6: 添加标点符号
+        if self.enable_punctuation:
+            result = self._add_punctuation(result)
+
+        logger.info(f"规则文本后处理: '{text}' → '{result}'")
+        return result
+
+    def _remove_fillers(self, text: str) -> str:
+        """去除填充词"""
+        result = text
+
         # 删除句首填充词
-        for pattern in self._filler_patterns:
+        for pattern in self._sentence_initial_fillers:
             result = pattern.sub('', result)
 
-        # 删除句尾语气词
-        for pattern in self._final_filler_patterns:
+        # 删除句尾填充词
+        for pattern in self._sentence_final_fillers:
             result = pattern.sub('', result)
 
         # 清理多余空格
@@ -233,213 +216,91 @@ class TextPostProcessor:
 
         return result
 
-    def _add_internal_punctuation(self, text: str) -> str:
+    def _fix_letter_spelling(self, text: str) -> str:
         """
-        添加内部标点（顿号、逗号等）- 基于外部成功案例的增强策略
+        修复逐字母拼写（语音识别特有功能）
 
-        规则优先级（参考 HarvestText、sentence_segmenter 等项目）：
-        1. 引号内容保护（避免在引号内错误断句）
-        2. 语气词后加逗号
-        3. 重复主语模式断句
-        4. 疑问/感叹语气词断句
-        5. 时间/状态过渡
-        6. 复句连接词处理
-        7. 并列关系处理
-        8. 清理多余标点
+        场景：语音识别将 "API" 识别为 "a p i"
         """
         result = text
 
-        # ========== 0. 引号内容保护（参考 HarvestText）==========
-        # 避免在引号内错误添加标点
-        # 标记引号位置，处理时避开
-        quote_positions = []
-        for match in re.finditer(r'[""'']([^"'']*?)[""'']', result):
-            quote_positions.append((match.start(), match.end()))
+        def try_fix(match):
+            letters_part = match.group(0)
+            letters = letters_part.replace(' ', '')
+            # 只有在字典中存在时才修复
+            if letters.lower() in self._english_capitalization:
+                return letters
+            return match.group(0)
 
-        # ========== 1. 确认/应答语气词后加逗号（参考 GB/T 15834-2011）==========
-        # "好的/对的/是的/嗯" + 后续内容 → 加逗号
-        for word in self.CONFIRMATION_WORDS:
-            # 匹配：确认词 + 中文内容（至少2字）
-            # 负向先行断言：避免在"可以"等词后错误添加
-            pattern = re.escape(word) + r'([\u4e00-\u9fff]{2,})'
-            if re.search(pattern, result):
-                result = re.sub(pattern, word + r'，\1', result, count=1)
+        result = self._letter_spacing_pattern.sub(try_fix, result)
+        return result
 
-        # ========== 2. 重复主语模式断句（参考外部案例 + 扩展）==========
-        # 检测 "我X我Y" 或 "我在X我在Y" 模式，中间加逗号
-        pronouns = ['我', '你', '他', '她', '它', '我们', '你们', '他们']
-        for pronoun in pronouns:
-            # 2.1 优先匹配："我在(1-8字)我在" 这种精确模式
-            pattern1 = pronoun + r'在([\u4e00-\u9fff]{1,8})' + pronoun + r'在'
-            if re.search(pattern1, result):
-                result = re.sub(pattern1, pronoun + r'在\1，' + pronoun + r'在', result, count=1)
-                continue
+    def _apply_pangu_spacing(self, text: str) -> str:
+        """
+        应用 pangu 风格的空格规则（核心逻辑）
 
-            # 2.2 匹配："我(1-8字)我" 这种通用模式
-            pattern2 = pronoun + r'([\u4e00-\u9fff]{1,8})' + pronoun
-            # 避免简单的"我和你"、"我的"等搭配
-            if (re.search(pattern2, result) and
-                not re.search(pronoun + r'(和|的|跟|与|给|为|把|被)' + pronoun, result)):
-                result = re.sub(pattern2, pronoun + r'\1，' + pronoun, result, count=1)
+        参考 pangu.py 的 spacing() 函数
+        """
+        # 如果没有 CJK 字符，直接返回
+        if not ANY_CJK.search(text):
+            return text
 
-        # ========== 3. 疑问/感叹语气词断句（谨慎处理）==========
-        # 只在明确的主语重复或话题转换时才断句
-        # "你看吗我不看" 这种模式：...吗/呢 + 新主语...
-        for particle in ['吗', '呢']:
-            # 检测：...吗 + 我/你/他（主语重复）
-            pattern = re.escape(particle) + r'([我你他她])'
-            if re.search(pattern, result):
-                result = re.sub(pattern, particle + r'？，\1', result, count=1)
+        result = text
 
-        # ========== 4. 时间/状态总结 + 后续动作 ==========
-        # "今天就先这样接下来" → "今天就先这样，接下来"
-        transition_patterns = [
-            (r'(先这样|就这样|到这里)([\u4e00-\u9fff]{2,})', r'\1，\2'),
-            (r'(现在|接下来|后来|之后)([\u4e00-\u9fff]{3,})', r'\1，\2'),
-            # "然后"需要特殊处理，避免在"然后回家"中添加逗号
-            (r'然后([\u4e00-\u9fff]{6,})', r'然后，\1'),  # 只在后面内容较长时添加逗号
-        ]
-        for pattern, replacement in transition_patterns:
-            result = re.sub(pattern, replacement, result, count=1)
+        # 按照 pangu.py 的顺序应用规则
+        result = self._cjk_ans.sub(r'\1 \2', result)      # CJK → 英文
+        result = self._ans_cjk.sub(r'\1 \2', result)      # 英文 → CJK
+        result = self._cjk_operator_ans.sub(r'\1 \2 \3', result)  # CJK 操作符 英文
+        result = self._ans_operator_cjk.sub(r'\1 \2 \3', result)  # 英文 操作符 CJK
+        result = self._cjk_left_bracket.sub(r'\1 \2', result)     # CJK 括号
+        result = self._right_bracket_cjk.sub(r'\1 \2', result)    # 括号 CJK
+        result = self._an_left_bracket.sub(r'\1 \2', result)       # 英文 括号
+        result = self._right_bracket_an.sub(r'\1 \2', result)      # 括号 英文
+        result = self._cjk_quote.sub(r'\1 \2', result)            # CJK 引号
+        result = self._quote_cjk.sub(r'\1 \2', result)            # 引号 CJK
 
-        # ========== 5. 复句连接词处理（参考复句关联词研究）==========
-        # 5.1 在明确的连接词前添加逗号（谨慎处理，避免过度使用）
-        # 只在分句之间添加逗号，不在连接词前无条件添加
-        # 规则：连接词前面至少有3个字符，且不是句首
-        for word in ['但是', '可是', '不过', '所以', '因此', '然而', '而且', '并且']:
-            # 确保前面至少有3个字符
-            result = re.sub(r'(.{3,})' + re.escape(word), r'\1，' + word, result, count=1)
-
-        # 5.2 在明确的连接词后添加逗号（序数词等，不包括时间词）
-        for word in ['首先', '其次', '最后', '总之', '另外', '此外']:
-            result = re.sub(re.escape(word) + r'([\u4e00-\u9fff]{2,})', word + r'，\1', result, count=1)
-        # 注意：不在"今天"、"明天"、"昨天"后无条件添加逗号，避免过度使用
-
-        # 5.3 "如果...的话" 特殊处理
-        # 避免在"如果可以的话"中错误添加逗号
-        if '如果' in result and '的话' in result:
-            # 只在"如果...的话"完整结构中，且"的话"后有足够内容时，在"的话"后添加逗号
-            result = re.sub(
-                r'如果(.{2,})的话([\u4e00-\u9fff]{3,})',
-                r'如果\1的话，\2',
-                result,
-                count=1
-            )
-        # 注意：不在"如果"前无条件添加逗号，避免"如果明天..."变成"，如果明天..."
-
-        # ========== 6. 并列关系处理 ==========
-        # "A、B和C" 或 "A、B、C" → 已经有顿号的不处理
-        # 只有在没有顿号但有多个"和"时才转换
-        if '和' in result and '、' not in result:
-            # 检查是否是多项并列（3个或更多的名词用"和"连接）
-            # 但避免简单的"我和你"结构
-            and_count = result.count('和')
-            if and_count >= 2:
-                # 多项并列：A和B和C → A、B、C
-                result = re.sub(r'和', '、', result)
-
-        # ========== 7. 清理多余的标点 ==========
-        result = re.sub(r'，+', '，', result)
-        result = re.sub(r'？+', '？', result)
-        result = re.sub(r'！+', '！', result)
-        result = re.sub(r'^，|，$|^？|？$|^！|！$', '', result)
+        # 清理多余空格
+        result = re.sub(r'  +', ' ', result)
 
         return result
 
-    def _segment_long_sentence(self, text: str) -> str:
-        """长句分段"""
-        if len(text) <= self.MAX_SENTENCE_LENGTH:
-            return text
+    def _fix_english_capitalization(self, text: str) -> str:
+        """修复英文大小写"""
+        result = text
 
-        # 尝试在分段标记处分段
-        for marker in self.SEGMENT_MARKERS:
-            if marker in text:
-                idx = text.index(marker)
-                # 确保前面有足够的内容
-                if idx > 8 and len(text) - idx > 5:
-                    return text[:idx] + '。' + marker + text[idx:]
+        # 按长度降序处理，避免短词覆盖长词
+        sorted_terms = sorted(self._english_capitalization.items(),
+                             key=lambda x: len(x[0]), reverse=True)
 
-        # 如果没有合适的分段点，尝试在"然后"等连接词前分段
-        for conn in ['然后', '之后', '后来', '接着']:
-            if conn in text:
-                idx = text.index(conn)
-                if idx > 8 and idx < len(text) - 5:
-                    return text[:idx] + '。' + text[idx:]
+        for term_lower, term_correct in sorted_terms:
+            # 使用单词边界，避免部分替换
+            pattern = r'\b' + re.escape(term_lower) + r'\b'
+            result = re.sub(pattern, term_correct, result, flags=re.IGNORECASE)
 
-        return text
-
-    def _add_sentence_punctuation(self, text: str) -> str:
-        """添加句末标点"""
-        # 检测英文比例
-        english_ratio = self._detect_english_ratio(text)
-
-        # 如果已经有标点，不需要添加
-        if any(text.endswith(p) for p in '。！？；：、,!?;:'):
-            return text
-
-        # 检测是否包含中文字符
-        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
-
-        # 策略：
-        # 1. 如果包含中文字符，使用中文标点（除非英文占绝大多数>85%）
-        # 2. 如果不包含中文字符，根据英文比例判断
-        if has_chinese:
-            # 包含中文，默认使用中文标点
-            # 只有当英文占绝大多数时才考虑英文标点
-            if english_ratio > 0.85:
-                # 英文占绝大多数，使用英文标点
-                if any(marker in text.lower() for marker in ['what', 'how', 'why', 'where', 'when', 'who', '?']):
-                    return text + '?'
-                elif any(marker in text.lower() for marker in ['wow', 'amazing', 'great', '!', 'really']):
-                    return text + '!'
-                else:
-                    return text + '.'
-            else:
-                # 中英混合，使用中文标点
-                if any(marker in text for marker in self.QUESTION_MARKERS):
-                    return text + '？'
-                if any(marker in text for marker in self.EXCLAMATION_MARKERS):
-                    return text + '！'
-                return text + '。'
-        else:
-            # 不包含中文，使用英文标点规则
-            if any(marker in text.lower() for marker in ['what', 'how', 'why', 'where', 'when', 'who', '?']):
-                return text + '?'
-            elif any(marker in text.lower() for marker in ['wow', 'amazing', 'great', '!', 'really']):
-                return text + '!'
-            else:
-                return text + '.'
-
-    def process_with_rules(self, text: str) -> str:
-        """使用增强规则处理文本（包含英文优化）"""
-        if not text:
-            return text
-
-        # 预处理：去除首尾空白字符
-        text = text.strip()
-        if not text:
-            return text
-
-        # 步骤1: 去除填充词
-        result = self._remove_filler_words(text)
-
-        # 步骤2: 修复英文大小写
-        result = self._fix_english_capitalization(result)
-
-        # 步骤3: 长句分段
-        if self.enable_punctuation:
-            result = self._segment_long_sentence(result)
-
-        # 步骤4: 添加内部标点
-        if self.enable_punctuation:
-            result = self._add_internal_punctuation(result)
-
-        # 步骤5: 添加句末标点
-        if self.enable_punctuation:
-            result = self._add_sentence_punctuation(result)
-
-        logger.info(f"规则文本后处理: '{text}' → '{result}'")
         return result
+
+    def _add_punctuation(self, text: str) -> str:
+        """
+        添加标点符号
+
+        简化版本，专注于句末标点
+        """
+        # 如果已经有标点，直接返回
+        if text[-1:] in ['。', '！', '？', '.', '!', '?', '，', '、', ';', '；']:
+            return text
+
+        # 检测疑问语气
+        question_markers = ['什么', '怎么', '为什么', '哪里', '吗', '呢']
+        if any(marker in text for marker in question_markers):
+            return text + '？'
+
+        # 检测感叹语气
+        exclamation_markers = ['真', '太', '非常', '超级']
+        if any(marker in text for marker in exclamation_markers):
+            return text + '！'
+
+        # 默认句号
+        return text + '。'
 
     def _convert_chinese_numbers(self, text: str) -> str:
         """
@@ -450,18 +311,23 @@ class TextPostProcessor:
         2. 保留前导零：零一二三 → 0123
         3. 连续数字转换：一二三四五 → 12345
         4. 保护词语中的"一"不被转换：一些、一致、一会儿等
+
+        性能优化：
+        - 快速检测是否需要转换（避免不必要的处理）
+        - 完善的异常处理
         """
+        # 快速检测：如果文本中没有中文数字字符，直接返回
+        chinese_digits = '零一二三四五六七八九十百千万亿两〇幺'
+        if not any(c in text for c in chinese_digits):
+            return text
+
         try:
             import cn2an
 
             # 保护模式：包含"一"但不应被转换的词语
-            # 使用占位符先替换，转换后再还原
-            # 重要：只保护完整的词语，不匹配子串
             protected_patterns = [
-                # 常见词汇
                 '一些', '一般', '一样', '一起', '一致', '一会儿',
                 '一定', '一旦', '一边', '一直', '一下',
-                # 更多词汇
                 '万一', '唯一', '第一', '统一', '一切', '一向',
                 '一处', '一点', '一种', '个个', '同时',
             ]
@@ -470,26 +336,17 @@ class TextPostProcessor:
             protected_patterns = sorted(list(set(protected_patterns)), key=len, reverse=True)
 
             # 使用占位符保护这些词语
-            # 只匹配完整的独立词语，避免子串匹配（如"十一下"中的"一下"）
-            # 关键：前后不能是中文数字字符，但可以是其他中文字符
-            import re
             placeholders = []
             protected_text = text
 
             # 中文数字字符（这些字符前后不能有被保护的词）
-            chinese_digits = '零一二三四五六七八九十百千万亿两〇'
+            chinese_digits_pattern = '零一二三四五六七八九十百千万亿两〇'
 
             for i, pattern in enumerate(protected_patterns):
                 # 创建正则模式：pattern 前后不能是中文数字字符
-                # 使用负向后顾和负向前瞻
                 pattern_escaped = re.escape(pattern)
-
-                # 负向后顾：前面不能是中文数字（或字符串开头）
-                # 负向前瞻：后面不能是中文数字（或字符串结尾）
-                # 注意：允许前面/后面是其他中文字符（非数字）
-                negative_lookbehind = f'(?<![{chinese_digits}])'
-                negative_lookahead = f'(?![{chinese_digits}])'
-
+                negative_lookbehind = f'(?<![{chinese_digits_pattern}])'
+                negative_lookahead = f'(?![{chinese_digits_pattern}])'
                 regex_pattern = negative_lookbehind + pattern_escaped + negative_lookahead
 
                 def make_replacer(p_idx, p_pattern):
@@ -501,42 +358,16 @@ class TextPostProcessor:
 
                 protected_text = re.sub(regex_pattern, make_replacer(i, pattern), protected_text)
 
-            # 预处理：记录前导零位置，用于后续恢复
-            leading_zero_positions = []
-            text_chars = list(protected_text)
-            for i, char in enumerate(text_chars):
-                if char == '零':
-                    # 检查是否是前导零（在数字序列开头）
-                    # 向前检查，看看前面是否有非零数字
-                    has_non_zero_before = False
-                    for j in range(i):
-                        if text_chars[j] in '一二三四五六七八九十两':
-                            has_non_zero_before = True
-                            break
-                    if not has_non_zero_before:
-                        # 向后检查是否有数字
-                        has_number_after = False
-                        for j in range(i+1, len(text_chars)):
-                            if text_chars[j] in '一二三四五六七八九十零〇两':
-                                has_number_after = True
-                                break
-                        if has_number_after:
-                            leading_zero_positions.append(i)
-
             # 预处理：将"幺"替换为"一"（只在数字语境下）
-            # "幺"通常出现在电话号码、密码等数字序列中
             processed_text = protected_text
-            # 检测"幺"是否在数字序列中
             i = 0
             while i < len(processed_text):
                 if processed_text[i] == '幺':
                     # 检查前后是否有数字字符
                     in_number_context = False
-                    # 检查前后2个字符
                     start = max(0, i - 2)
                     end = min(len(processed_text), i + 3)
                     context = processed_text[start:end]
-                    # 如果前后有数字，就是在数字语境中
                     for c in context:
                         if c in '零〇一二三四五六七八九十两':
                             in_number_context = True
@@ -548,20 +379,6 @@ class TextPostProcessor:
             # 使用 cn2an 转换
             result = cn2an.transform(processed_text)
 
-            # 后处理：恢复前导零
-            if leading_zero_positions:
-                # cn2an 会把前导零去掉，需要恢复
-                # 检查转换后的文本，在相应位置插入 '0'
-                result_list = list(result)
-                offset = 0  # 由于插入字符，位置需要偏移
-                for pos in leading_zero_positions:
-                    # 找到对应位置（考虑文本变化）
-                    insert_pos = pos + offset
-                    if insert_pos < len(result_list):
-                        result_list.insert(insert_pos, '0')
-                        offset += 1
-                result = ''.join(result_list)
-
             # 后处理：恢复保护的词语
             for placeholder, original in placeholders:
                 result = result.replace(placeholder, original)
@@ -569,142 +386,40 @@ class TextPostProcessor:
             return result
 
         except ImportError:
-            # 如果 cn2an 未安装，使用简单规则
-            logger.warning("cn2an 库未安装，使用简单数字转换")
-            return self._simple_number_convert(text)
+            logger.warning("cn2an 库未安装，跳过中文数字转换")
+            return text
         except Exception as e:
-            logger.warning(f"数字转换失败: {e}，使用简单转换")
-            return self._simple_number_convert(text)
-
-    def _simple_number_convert(self, text: str) -> str:
-        """简单的数字转换（cn2an 不可用时）"""
-        # 中文数字映射
-        cn_num_map = {
-            '零': '0', '〇': '0',
-            '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
-            '六': '6', '七': '7', '八': '8', '九': '9',
-            '两': '2',
-            '幺': '1',  # 幺 → 一
-        }
-
-        result = []
-        i = 0
-        while i < len(text):
-            char = text[i]
-            if char in cn_num_map:
-                # 检查是否是连续的数字序列
-                is_number_seq = True
-                j = i
-                while j < len(text) and text[j] in cn_num_map:
-                    j += 1
-                # 如果连续2个或以上数字，转换它们
-                if j - i >= 2:
-                    for k in range(i, j):
-                        result.append(cn_num_map.get(text[k], text[k]))
-                    i = j
-                else:
-                    # 单个数字也转换
-                    result.append(cn_num_map.get(char, char))
-                    i += 1
-            else:
-                result.append(char)
-                i += 1
-
-        return ''.join(result)
-
-    def process(self, text: str) -> str:
-        """完整处理流程（纯规则引擎）"""
-        if not text:
+            logger.warning(f"中文数字转换失败: {e}，返回原文")
             return text
 
-        # 使用规则引擎处理
-        result = self.process_with_rules(text)
 
-        # 智能数字转换
-        result = self._convert_chinese_numbers(result)
+# 向后兼容的别名
+def process_with_rules(text: str) -> str:
+    """向后兼容的处理函数"""
+    processor = TextPostProcessor()
+    return processor.process(text)
 
-        return result
 
-
-# ==================== 单例 ====================
-
-_postprocessor = None
+# ==================== 单例模式（线程安全）====================
+_processor_instance: Optional[TextPostProcessor] = None
+_processor_lock = None  # 延迟导入 threading
 
 
 def get_text_postprocessor() -> TextPostProcessor:
-    """获取全局文本后处理器实例"""
-    global _postprocessor
-    if _postprocessor is None:
-        _postprocessor = TextPostProcessor()
-    return _postprocessor
+    """
+    获取文本后处理器单例（线程安全）
 
+    Returns:
+        TextPostProcessor: 文本后处理器实例
+    """
+    global _processor_instance, _processor_lock
+    if _processor_lock is None:
+        import threading
+        _processor_lock = threading.Lock()
 
-# ==================== 使用示例 ====================
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-
-    processor = TextPostProcessor()
-
-    # 测试用例
-    test_cases = [
-        # 基础测试
-        "嗯嗯今天天气真不错啊",
-        "那个那个我想问一下这个问题怎么解决呢",
-        "啊啊今天天气怎么样",
-
-        # 并列关系
-        "我喜欢苹果和香蕉和橙子",
-        "这个项目涉及设计和开发和测试",
-
-        # 复句处理
-        "因为今天下雨所以我不出去",
-        "虽然很累但是很开心",
-        "如果明天天气好我们就去爬山",
-
-        # 长句
-        "今天我去了超市买菜然后回家做饭然后休息了一会儿",
-
-        # 疑问句
-        "这个问题怎么解决",
-
-        # 感叹句
-        "这个地方真是太美了",
-
-        # 时间状语
-        "今天天气很好",
-
-        # 递进关系
-        "这个方案很好而且很实用",
-
-        # ========== 英文测试 ==========
-
-        # 英文大小写
-        "这个api很好用",
-        "我用了python和java",
-        "google公司的ai技术很强",
-
-        # 中英文混合
-        "你好hello",
-        "我去google公司工作",
-
-        # 纯英文句子
-        "hello world",
-        "this is a test",
-
-        # 中英文边界
-        "这个cpu性能很好",
-    ]
-
-    print("=" * 60)
-    print("增强规则文本处理测试")
-    print("=" * 60)
-
-    for test in test_cases:
-        result = processor.process(test)
-        print(f"原文: {test}")
-        print(f"结果: {result}")
-        print()
+    if _processor_instance is None:
+        with _processor_lock:
+            # 双重检查锁定
+            if _processor_instance is None:
+                _processor_instance = TextPostProcessor()
+    return _processor_instance

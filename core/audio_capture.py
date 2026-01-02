@@ -186,27 +186,68 @@ class AudioCapture:
             return None
 
         try:
-            # 停止音频流
-            if self._stream:
-                self._stream.stop()
-                self._stream.close()
-                self._stream = None
-
+            # 先保存音频缓冲区和状态，防止后续操作失败
+            audio_buffer = self._audio_buffer.copy() if self._audio_buffer else []
             self._is_recording = False
 
-            # 合并音频数据
-            if not self._audio_buffer:
+            logger.debug(f"准备停止音频流，缓冲区有 {len(audio_buffer)} 帧")
+
+            # 停止音频流（带超时保护）
+            if self._stream:
+                try:
+                    # 使用线程来避免阻塞
+                    import threading
+                    import time
+
+                    stop_result = {'done': False, 'error': None}
+
+                    def stop_stream():
+                        try:
+                            self._stream.stop()
+                            self._stream.close()
+                            stop_result['done'] = True
+                        except Exception as e:
+                            stop_result['error'] = e
+                        finally:
+                            self._stream = None
+
+                    # 启动停止线程
+                    stop_thread = threading.Thread(target=stop_stream, daemon=True)
+                    stop_thread.start()
+
+                    # 等待最多 2 秒
+                    stop_thread.join(timeout=2.0)
+
+                    if not stop_result['done']:
+                        logger.warning("音频流停止超时，强制跳过")
+                        # 强制清理
+                        self._stream = None
+                    elif stop_result['error']:
+                        raise stop_result['error']
+
+                    logger.debug("音频流已停止")
+
+                except Exception as e:
+                    logger.warning(f"停止音频流时出错: {e}，继续处理")
+                    self._stream = None
+
+            # 检查是否有音频数据
+            if not audio_buffer:
                 logger.warning("没有录制到音频数据")
                 return None
 
             # 转换为 WAV 格式
-            wav_data = self._convert_to_wav(self._audio_buffer)
+            logger.debug("开始转换音频为 WAV 格式")
+            wav_data = self._convert_to_wav(audio_buffer)
 
-            logger.info(f"停止录音，共 {len(self._audio_buffer)} 帧")
+            logger.info(f"停止录音，共 {len(audio_buffer)} 帧")
             return wav_data
 
         except Exception as e:
             logger.error(f"停止录音失败: {e}")
+            # 确保状态被重置
+            self._is_recording = False
+            self._stream = None
             return None
 
     def _audio_callback(self, indata, frames, time_info, status):
