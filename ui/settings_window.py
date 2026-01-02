@@ -2,6 +2,9 @@
 # PyQt6 设置窗口
 
 import logging
+import os
+import subprocess
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -22,6 +25,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QDialog,
     QHeaderView,
+    QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QKeyEvent
@@ -85,10 +89,20 @@ class SettingsWindow(QWidget):
     def init_ui(self):
         """初始化 UI"""
         self.setWindowTitle("快人快语 设置")
-        self.setMinimumSize(700, 650)
+        self.setMinimumSize(680, 720)
+        self.resize(680, 720)
 
+        # 创建滚动区域，防止内容超出
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        # 主容器
+        container = QWidget()
         layout = QVBoxLayout()
-        self.setLayout(layout)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+        container.setLayout(layout)
 
         # 快捷键设置
         layout.addWidget(self._create_hotkey_group())
@@ -99,22 +113,38 @@ class SettingsWindow(QWidget):
         # 翻译设置
         layout.addWidget(self._create_translation_group())
 
-        # 文本处理设置
+        # 文本处理
         layout.addWidget(self._create_text_processing_group())
 
         # 音频管理
         layout.addWidget(self._create_audio_management_group())
 
-        # 按钮
+        # 日志管理
+        layout.addWidget(self._create_log_management_group())
+
+        # 添加弹性空间
+        layout.addStretch()
+
+        # 底部按钮
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         save_btn = QPushButton("保存")
+        save_btn.setMinimumWidth(90)
         save_btn.clicked.connect(self.save_settings)
         cancel_btn = QPushButton("取消")
+        cancel_btn.setMinimumWidth(90)
         cancel_btn.clicked.connect(self.close)
         button_layout.addWidget(save_btn)
         button_layout.addWidget(cancel_btn)
         layout.addLayout(button_layout)
+
+        # 设置滚动区域
+        scroll.setWidget(container)
+
+        # 主布局
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(scroll)
 
     def _create_hotkey_group(self) -> QGroupBox:
         """创建快捷键设置组"""
@@ -235,7 +265,7 @@ class SettingsWindow(QWidget):
         # 统计信息
         self.audio_stats_label = QLabel()
         self._update_audio_stats()
-        layout.addWidget(self.audio_stats_label, 0, 0, 1, 3)
+        layout.addWidget(self.audio_stats_label, 0, 0, 1, 4)
 
         # 自动清理
         self.auto_cleanup_checkbox = QCheckBox("自动清理")
@@ -253,10 +283,79 @@ class SettingsWindow(QWidget):
         # 查看音频列表
         list_btn = QPushButton("查看音频列表...")
         list_btn.clicked.connect(self._show_audio_list)
-        layout.addWidget(list_btn, 2, 0, 1, 3)
+        layout.addWidget(list_btn, 1, 3)
 
         group.setLayout(layout)
         return group
+
+    def _create_log_management_group(self) -> QGroupBox:
+        """创建日志管理组"""
+        group = QGroupBox("日志管理")
+        layout = QGridLayout()
+
+        # 日志文件信息
+        self.log_stats_label = QLabel()
+        self._update_log_stats()
+        layout.addWidget(self.log_stats_label, 0, 0, 1, 2)
+
+        # 清空日志按钮
+        clear_logs_btn = QPushButton("清空日志文件")
+        clear_logs_btn.clicked.connect(self._clear_logs)
+        layout.addWidget(clear_logs_btn, 0, 2)
+
+        group.setLayout(layout)
+        return group
+
+    def _update_log_stats(self):
+        """更新日志统计信息"""
+        logs_dir = Path("logs")
+        if not logs_dir.exists():
+            self.log_stats_label.setText("日志文件夹不存在")
+            return
+
+        log_files = list(logs_dir.glob("*.log"))
+        if not log_files:
+            self.log_stats_label.setText("暂无日志文件")
+            return
+
+        # 计算总大小
+        total_size = sum(f.stat().st_size for f in log_files)
+        size_mb = total_size / (1024 * 1024)
+        self.log_stats_label.setText(f"日志文件: {len(log_files)} 个，共 {size_mb:.2f} MB")
+
+    def _clear_logs(self):
+        """清空日志文件"""
+        logs_dir = Path("logs")
+        if not logs_dir.exists():
+            QMessageBox.information(self, "提示", "日志文件夹不存在")
+            return
+
+        # 获取所有日志文件
+        log_files = list(logs_dir.glob("*.log"))
+        if not log_files:
+            QMessageBox.information(self, "提示", "没有日志文件")
+            return
+
+        # 计算总大小
+        total_size = sum(f.stat().st_size for f in log_files)
+        size_mb = total_size / (1024 * 1024)
+
+        reply = QMessageBox.question(
+            self,
+            "确认清空",
+            f"确定要清空所有日志文件吗？\n共 {len(log_files)} 个文件，{size_mb:.2f} MB\n\n清空后日志文件会保留，但内容会被清空。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                # 清空每个日志文件（而不是删除文件）
+                for log_file in log_files:
+                    log_file.write_text("")
+                QMessageBox.information(self, "完成", f"已清空 {len(log_files)} 个日志文件")
+                self._update_log_stats()
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"清空日志失败: {e}")
 
     def _refresh_microphones(self):
         """刷新麦克风列表"""
@@ -465,6 +564,10 @@ class AudioListDialog(QDialog):
         self.delete_btn.clicked.connect(self._delete_selected)
         btn_layout.addWidget(self.delete_btn)
 
+        self.open_folder_btn = QPushButton("打开音频文件夹")
+        self.open_folder_btn.clicked.connect(self._open_audio_folder)
+        btn_layout.addWidget(self.open_folder_btn)
+
         layout.addLayout(btn_layout)
 
     def _load_files(self):
@@ -533,6 +636,20 @@ class AudioListDialog(QDialog):
             count = self.audio_manager.delete_files(selected_paths)
             QMessageBox.information(self, "完成", f"已删除 {count} 个文件")
             self._load_files()
+
+    def _open_audio_folder(self):
+        """打开音频文件夹"""
+        audio_dir = str(self.audio_manager.audio_dir)
+
+        try:
+            if IS_MACOS:
+                # macOS 使用 open
+                subprocess.run(["open", audio_dir])
+            else:
+                # Windows 使用 explorer
+                subprocess.run(["explorer", audio_dir])
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开文件夹: {e}")
 
 
 # ==================== 使用示例 ====================

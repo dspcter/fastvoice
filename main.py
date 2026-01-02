@@ -115,14 +115,29 @@ class FastVoiceApp:
         if self._is_recording:
             return
 
+        # 安全检查：如果 audio_capture 存在但未在录音，重置状态
+        if self.audio_capture and not self.audio_capture.is_recording():
+            logger.debug("清理异常状态：audio_capture 存在但未录音")
+            self._is_recording = False
+
         logger.info("开始录音 (语音输入)")
         self._is_recording = True
 
-        # 创建音频采集器
+        # 创建音频采集器，传入自动停止回调
+        def on_auto_stop(audio_data: bytes):
+            """录音超时自动停止时的处理"""
+            logger.info("录音自动停止（超时）")
+            self._is_recording = False
+            # 保存音频文件
+            filepath = self.audio_capture.save_audio(audio_data)
+            # 语音识别并直接注入原文
+            self._process_voice_input(audio_data, translate=False)
+
         self.audio_capture = AudioCapture(
             sample_rate=self.settings.sample_rate,
             vad_threshold=self.settings.vad_threshold,
             device=self.settings.microphone_device or None,
+            on_auto_stop=on_auto_stop,
         )
 
         # 开始录音
@@ -153,14 +168,29 @@ class FastVoiceApp:
         if self._is_translating:
             return
 
+        # 安全检查：如果 _translate_capture 存在但未在录音，重置状态
+        if self._translate_capture and not self._translate_capture.is_recording():
+            logger.debug("清理异常状态：_translate_capture 存在但未录音")
+            self._is_translating = False
+
         logger.info("开始录音 (翻译)")
         self._is_translating = True
 
-        # 创建音频采集器
+        # 创建音频采集器，传入自动停止回调
+        def on_auto_stop(audio_data: bytes):
+            """录音超时自动停止时的处理"""
+            logger.info("翻译录音自动停止（超时）")
+            self._is_translating = False
+            # 保存音频文件
+            filepath = self._translate_capture.save_audio(audio_data)
+            # 语音识别并翻译
+            self._process_voice_input(audio_data, translate=True)
+
         self._translate_capture = AudioCapture(
             sample_rate=self.settings.sample_rate,
             vad_threshold=self.settings.vad_threshold,
             device=self.settings.microphone_device or None,
+            on_auto_stop=on_auto_stop,
         )
 
         # 开始录音

@@ -179,6 +179,9 @@ class TextPostProcessor:
         if self.enable_filler_removal:
             result = self._remove_fillers(result)
 
+        # 步骤1.5: 修复常见识别错误
+        result = self._fix_common_asr_errors(result)
+
         # 步骤2: 修复逐字母拼写（语音识别特有）
         result = self._fix_letter_spelling(result)
 
@@ -213,6 +216,29 @@ class TextPostProcessor:
         # 清理多余空格
         result = re.sub(r'\s+', ' ', result)
         result = re.sub(r'^\s+|\s+$', '', result)
+
+        return result
+
+    def _fix_common_asr_errors(self, text: str) -> str:
+        """
+        修复语音识别的常见错误
+
+        针对容易混淆的词汇进行修正
+        """
+        result = text
+
+        # 常见识别错误映射（按上下文匹配）
+        common_errors = [
+            # GitHub 相关
+            (r'\bget up\b', 'github'),  # "get up" → "github"
+            (r'\bget hub\b', 'github'),  # "get hub" → "github"
+
+            # 其他常见错误（可继续添加）
+            # (r'\b错误写法\b', '正确写法'),
+        ]
+
+        for pattern, correction in common_errors:
+            result = re.sub(pattern, correction, result, flags=re.IGNORECASE)
 
         return result
 

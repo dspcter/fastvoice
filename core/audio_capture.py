@@ -10,7 +10,7 @@ import wave
 import webrtcvad
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import sounddevice as sd
 import numpy as np
@@ -34,6 +34,7 @@ class AudioCapture:
     # VAD 参数
     VAD_FRAME_DURATION_MS = 30  # 每帧时长 (毫秒)
     VAD_AGGRESSIVENESS = 2      # 激进程度 (0-3)
+    MAX_RECORDING_DURATION = 30  # 最大录音时长（秒）- 防止按键释放丢失导致录音卡住
 
     def __init__(
         self,
@@ -41,6 +42,8 @@ class AudioCapture:
         channels: int = 1,
         vad_threshold: int = 500,
         device: Optional[str] = None,
+        max_recording_duration: int = MAX_RECORDING_DURATION,
+        on_auto_stop: Optional[Callable] = None,
     ):
         """
         初始化音频采集器
@@ -50,10 +53,14 @@ class AudioCapture:
             channels: 声道数 (默认 1)
             vad_threshold: VAD 静音阈值 (毫秒)
             device: 麦克风设备名称
+            max_recording_duration: 最大录音时长（秒），防止按键释放丢失
+            on_auto_stop: 自动停止时的回调函数（参数为音频数据）
         """
         self.sample_rate = sample_rate
         self.channels = channels
         self.vad_threshold = vad_threshold
+        self.max_recording_duration = max_recording_duration
+        self._on_auto_stop = on_auto_stop
 
         # 音频帧大小
         self.frame_size = int(sample_rate * self.VAD_FRAME_DURATION_MS / 1000)
@@ -70,6 +77,10 @@ class AudioCapture:
         self._audio_queue = queue.Queue()
         self._record_thread: Optional[threading.Thread] = None
         self._stream: Optional[sd.InputStream] = None
+        self._timeout_thread: Optional[threading.Thread] = None
+
+        # 录音开始时间（用于超时检测）
+        self._recording_start_time: Optional[float] = None
 
         # 音频数据缓冲
         self._audio_buffer = []
@@ -155,24 +166,56 @@ class AudioCapture:
             self._audio_buffer = []
             self._silence_frames = 0
             self._voice_detected = False
+            self._recording_start_time = time.time()
+            self._is_recording = True  # 先设置为 True，让超时监控可以工作
 
-            # 创建音频流
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                device=self._device_index,
-                dtype=np.int16,
-                callback=self._audio_callback,
-            )
+            # 启动超时保护线程（在创建流之前启动，防止卡死）
+            self._start_timeout_monitor()
 
-            self._stream.start()
-            self._is_recording = True
+            # 创建音频流（添加超时保护）
+            stream_created = {'done': False, 'stream': None, 'error': None}
+
+            def create_stream():
+                try:
+                    stream = sd.InputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        device=self._device_index,
+                        dtype=np.int16,
+                        callback=self._audio_callback,
+                    )
+                    stream_created['stream'] = stream
+                    stream.start()
+                    stream_created['done'] = True
+                except Exception as e:
+                    stream_created['error'] = e
+                    stream_created['done'] = True
+
+            # 在线程中创建流，设置 5 秒超时
+            import threading
+            create_thread = threading.Thread(target=create_stream, daemon=True)
+            create_thread.start()
+            create_thread.join(timeout=5.0)
+
+            if not stream_created['done']:
+                # 超时 - 流创建卡住
+                logger.error("音频流创建超时，可能设备被占用")
+                self._is_recording = False
+                self._recording_start_time = None
+                return False
+
+            if stream_created['error']:
+                raise stream_created['error']
+
+            self._stream = stream_created['stream']
 
             logger.info("开始录音")
             return True
 
         except Exception as e:
             logger.error(f"启动录音失败: {e}")
+            self._is_recording = False
+            self._recording_start_time = None
             return False
 
     def stop_recording(self) -> Optional[bytes]:
@@ -189,6 +232,10 @@ class AudioCapture:
             # 先保存音频缓冲区和状态，防止后续操作失败
             audio_buffer = self._audio_buffer.copy() if self._audio_buffer else []
             self._is_recording = False
+            self._recording_start_time = None
+
+            # 停止超时监控线程
+            self._timeout_thread = None
 
             logger.debug(f"准备停止音频流，缓冲区有 {len(audio_buffer)} 帧")
 
@@ -400,6 +447,47 @@ class AudioCapture:
         silence_duration = self._silence_frames * self.VAD_FRAME_DURATION_MS
 
         return silence_duration >= self.vad_threshold
+
+    def _start_timeout_monitor(self) -> None:
+        """启动录音超时监控线程"""
+        def monitor():
+            while self._is_recording and self._recording_start_time:
+                elapsed = time.time() - self._recording_start_time
+                if elapsed >= self.max_recording_duration:
+                    logger.warning(f"录音超过最大时长 ({self.max_recording_duration}秒)，自动停止")
+
+                    # 检查是否有音频流（处理流创建卡住的情况）
+                    if self._stream is None:
+                        logger.error("音频流未创建，强制重置状态")
+                        self._is_recording = False
+                        self._recording_start_time = None
+                        # 不调用回调，因为没有音频数据
+                        break
+
+                    # 自动停止录音并获取音频数据
+                    audio_data = self.stop_recording()
+                    # 如果有回调且获取到音频数据，调用回调
+                    if self._on_auto_stop and audio_data:
+                        try:
+                            self._on_auto_stop(audio_data)
+                        except Exception as e:
+                            logger.error(f"自动停止回调执行失败: {e}")
+                    break
+                time.sleep(0.5)  # 每秒检查两次
+
+        self._timeout_thread = threading.Thread(target=monitor, daemon=True)
+        self._timeout_thread.start()
+
+    def get_recording_duration(self) -> float:
+        """
+        获取当前录音时长（秒）
+
+        Returns:
+            录音时长，未录音时返回 0
+        """
+        if not self._is_recording or not self._recording_start_time:
+            return 0.0
+        return time.time() - self._recording_start_time
 
 
 # ==================== 使用示例 ====================
