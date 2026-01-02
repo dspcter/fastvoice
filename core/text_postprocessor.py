@@ -449,13 +449,61 @@ class TextPostProcessor:
         1. "幺"在数字中替换为"一"：幺三八 → 138
         2. 保留前导零：零一二三 → 0123
         3. 连续数字转换：一二三四五 → 12345
+        4. 保护词语中的"一"不被转换：一些、一致、一会儿等
         """
         try:
             import cn2an
 
+            # 保护模式：包含"一"但不应被转换的词语
+            # 使用占位符先替换，转换后再还原
+            # 重要：只保护完整的词语，不匹配子串
+            protected_patterns = [
+                # 常见词汇
+                '一些', '一般', '一样', '一起', '一致', '一会儿',
+                '一定', '一旦', '一边', '一直', '一下',
+                # 更多词汇
+                '万一', '唯一', '第一', '统一', '一切', '一向',
+                '一处', '一点', '一种', '个个', '同时',
+            ]
+
+            # 去重并排序（长的模式优先匹配）
+            protected_patterns = sorted(list(set(protected_patterns)), key=len, reverse=True)
+
+            # 使用占位符保护这些词语
+            # 只匹配完整的独立词语，避免子串匹配（如"十一下"中的"一下"）
+            # 关键：前后不能是中文数字字符，但可以是其他中文字符
+            import re
+            placeholders = []
+            protected_text = text
+
+            # 中文数字字符（这些字符前后不能有被保护的词）
+            chinese_digits = '零一二三四五六七八九十百千万亿两〇'
+
+            for i, pattern in enumerate(protected_patterns):
+                # 创建正则模式：pattern 前后不能是中文数字字符
+                # 使用负向后顾和负向前瞻
+                pattern_escaped = re.escape(pattern)
+
+                # 负向后顾：前面不能是中文数字（或字符串开头）
+                # 负向前瞻：后面不能是中文数字（或字符串结尾）
+                # 注意：允许前面/后面是其他中文字符（非数字）
+                negative_lookbehind = f'(?<![{chinese_digits}])'
+                negative_lookahead = f'(?![{chinese_digits}])'
+
+                regex_pattern = negative_lookbehind + pattern_escaped + negative_lookahead
+
+                def make_replacer(p_idx, p_pattern):
+                    def replacer(match):
+                        placeholder = f"__PROTECTED_{p_idx}__"
+                        placeholders.append((placeholder, p_pattern))
+                        return placeholder
+                    return replacer
+
+                protected_text = re.sub(regex_pattern, make_replacer(i, pattern), protected_text)
+
             # 预处理：记录前导零位置，用于后续恢复
             leading_zero_positions = []
-            text_chars = list(text)
+            text_chars = list(protected_text)
             for i, char in enumerate(text_chars):
                 if char == '零':
                     # 检查是否是前导零（在数字序列开头）
@@ -477,7 +525,7 @@ class TextPostProcessor:
 
             # 预处理：将"幺"替换为"一"（只在数字语境下）
             # "幺"通常出现在电话号码、密码等数字序列中
-            processed_text = text
+            processed_text = protected_text
             # 检测"幺"是否在数字序列中
             i = 0
             while i < len(processed_text):
@@ -513,6 +561,10 @@ class TextPostProcessor:
                         result_list.insert(insert_pos, '0')
                         offset += 1
                 result = ''.join(result_list)
+
+            # 后处理：恢复保护的词语
+            for placeholder, original in placeholders:
+                result = result.replace(placeholder, original)
 
             return result
 
