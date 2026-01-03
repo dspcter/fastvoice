@@ -23,6 +23,34 @@ class TextPostProcessor:
     4. 保留语音识别特有的处理逻辑
     """
 
+    # ==================== 语气词规则（参考 GB/T 15834-2011）====================
+    # 确认/应答语气词（后加逗号）
+    CONFIRMATION_WORDS = [
+        '好的', '对的', '是的', '没问题', '不错', '行',
+        '好的好的', '对', '嗯', '噢', '诶', '喔',
+    ]
+
+    # ==================== 标点规则 ====================
+    # 疑问句关键词
+    QUESTION_MARKERS = [
+        '什么', '怎么', '为什么', '哪里', '哪儿', '哪', '吗',
+        '呢', '是不是', '对不对', '好不好', '行不行',
+    ]
+
+    # 感叹句关键词
+    EXCLAMATION_MARKERS = [
+        '真', '太', '超级', '非常', '特别', '相当', '极其',
+    ]
+
+    # 长句分段标记
+    SEGMENT_MARKERS = [
+        '然后', '之后', '接着', '后来', '现在',
+        '今天', '明天', '昨天',
+    ]
+
+    # 最大句子长度（超过此长度考虑分段）
+    MAX_SENTENCE_LENGTH = 30
+
     def __init__(self, enable_punctuation: bool = True, enable_filler_removal: bool = True):
         """
         初始化文本后处理器
@@ -160,10 +188,11 @@ class TextPostProcessor:
         处理流程（基于 pangu.py 理念）：
         1. 去除填充词
         2. 修复逐字母拼写
-        3. 转换中文数字
-        4. 应用 pangu 风格的空格规则
-        5. 修复英文大小写
-        6. 添加标点符号
+        3. 转换序数词（第X → 第X中文）
+        4. 转换中文数字
+        5. 应用 pangu 风格的空格规则
+        6. 修复英文大小写
+        7. 添加标点符号
         """
         if not text:
             return text
@@ -185,7 +214,10 @@ class TextPostProcessor:
         # 步骤2: 修复逐字母拼写（语音识别特有）
         result = self._fix_letter_spelling(result)
 
-        # 步骤3: 转换中文数字
+        # 步骤3: 转换序数词（第2 → 第二）
+        result = self._convert_ordinal_numbers(result)
+
+        # 步骤4: 转换中文数字
         result = self._convert_chinese_numbers(result)
 
         # 步骤4: 应用 pangu 风格的空格规则（核心）
@@ -196,6 +228,11 @@ class TextPostProcessor:
 
         # 步骤6: 添加标点符号
         if self.enable_punctuation:
+            # 6.1 长句分段
+            result = self._segment_long_sentence(result)
+            # 6.2 添加内部标点（逗号等）
+            result = self._add_internal_punctuation(result)
+            # 6.3 添加句末标点
             result = self._add_punctuation(result)
 
         logger.info(f"规则文本后处理: '{text}' → '{result}'")
@@ -305,6 +342,141 @@ class TextPostProcessor:
 
         return result
 
+    def _segment_long_sentence(self, text: str) -> str:
+        """长句分段"""
+        if len(text) <= self.MAX_SENTENCE_LENGTH:
+            return text
+
+        # 尝试在分段标记处分段
+        for marker in self.SEGMENT_MARKERS:
+            if marker in text:
+                idx = text.index(marker)
+                # 确保前面有足够的内容
+                if idx > 8 and len(text) - idx > 5:
+                    return text[:idx] + '。' + marker + text[idx:]
+
+        # 如果没有合适的分段点，尝试在"然后"等连接词前分段
+        for conn in ['然后', '之后', '后来', '接着']:
+            if conn in text:
+                idx = text.index(conn)
+                if idx > 8 and idx < len(text) - 5:
+                    return text[:idx] + '。' + text[idx:]
+
+        return text
+
+    def _add_internal_punctuation(self, text: str) -> str:
+        """
+        添加内部标点（顿号、逗号等）- 基于外部成功案例的增强策略
+
+        规则优先级（参考 HarvestText、sentence_segmenter 等项目）：
+        1. 引号内容保护（避免在引号内错误断句）
+        2. 语气词后加逗号
+        3. 重复主语模式断句
+        4. 疑问/感叹语气词断句
+        5. 时间/状态过渡
+        6. 复句连接词处理
+        7. 并列关系处理
+        8. 清理多余标点
+        """
+        result = text
+
+        # ========== 0. 引号内容保护（参考 HarvestText）==========
+        # 避免在引号内错误添加标点
+        # 标记引号位置，处理时避开
+        quote_positions = []
+        for match in re.finditer(r'[""'']([^"'']*?)[""'']', result):
+            quote_positions.append((match.start(), match.end()))
+
+        # ========== 1. 确认/应答语气词后加逗号（参考 GB/T 15834-2011）==========
+        # "好的/对的/是的/嗯" + 后续内容 → 加逗号
+        for word in self.CONFIRMATION_WORDS:
+            # 匹配：确认词 + 中文内容（至少2字）
+            # 负向先行断言：避免在"可以"等词后错误添加
+            pattern = re.escape(word) + r'([\u4e00-\u9fff]{2,})'
+            if re.search(pattern, result):
+                result = re.sub(pattern, word + r'，\1', result, count=1)
+
+        # ========== 2. 重复主语模式断句（参考外部案例 + 扩展）==========
+        # 检测 "我X我Y" 或 "我在X我在Y" 模式，中间加逗号
+        pronouns = ['我', '你', '他', '她', '它', '我们', '你们', '他们']
+        for pronoun in pronouns:
+            # 2.1 优先匹配："我在(1-8字)我在" 这种精确模式
+            pattern1 = pronoun + r'在([\u4e00-\u9fff]{1,8})' + pronoun + r'在'
+            if re.search(pattern1, result):
+                result = re.sub(pattern1, pronoun + r'在\1，' + pronoun + r'在', result, count=1)
+                continue
+
+            # 2.2 匹配："我(1-8字)我" 这种通用模式
+            pattern2 = pronoun + r'([\u4e00-\u9fff]{1,8})' + pronoun
+            # 避免简单的"我和你"、"我的"等搭配
+            if (re.search(pattern2, result) and
+                not re.search(pronoun + r'(和|的|跟|与|给|为|把|被)' + pronoun, result)):
+                result = re.sub(pattern2, pronoun + r'\1，' + pronoun, result, count=1)
+
+        # ========== 3. 疑问/感叹语气词断句（谨慎处理）==========
+        # 只在明确的主语重复或话题转换时才断句
+        # "你看吗我不看" 这种模式：...吗/呢 + 新主语...
+        for particle in ['吗', '呢']:
+            # 检测：...吗 + 我/你/他（主语重复）
+            pattern = re.escape(particle) + r'([我你他她])'
+            if re.search(pattern, result):
+                result = re.sub(pattern, particle + r'？，\1', result, count=1)
+
+        # ========== 4. 时间/状态总结 + 后续动作 ==========
+        # "今天就先这样接下来" → "今天就先这样，接下来"
+        transition_patterns = [
+            (r'(先这样|就这样|到这里)([\u4e00-\u9fff]{2,})', r'\1，\2'),
+            (r'(现在|接下来|后来|之后)([\u4e00-\u9fff]{3,})', r'\1，\2'),
+            # "然后"需要特殊处理，避免在"然后回家"中添加逗号
+            (r'然后([\u4e00-\u9fff]{6,})', r'然后，\1'),  # 只在后面内容较长时添加逗号
+        ]
+        for pattern, replacement in transition_patterns:
+            result = re.sub(pattern, replacement, result, count=1)
+
+        # ========== 5. 复句连接词处理（参考复句关联词研究）==========
+        # 5.1 在明确的连接词前添加逗号（谨慎处理，避免过度使用）
+        # 只在分句之间添加逗号，不在连接词前无条件添加
+        # 规则：连接词前面至少有3个字符，且不是句首
+        for word in ['但是', '可是', '不过', '所以', '因此', '然而', '而且', '并且']:
+            # 确保前面至少有3个字符
+            result = re.sub(r'(.{3,})' + re.escape(word), r'\1，' + word, result, count=1)
+
+        # 5.2 在明确的连接词后添加逗号（序数词等，不包括时间词）
+        for word in ['首先', '其次', '最后', '总之', '另外', '此外']:
+            result = re.sub(re.escape(word) + r'([\u4e00-\u9fff]{2,})', word + r'，\1', result, count=1)
+        # 注意：不在"今天"、"明天"、"昨天"后无条件添加逗号，避免过度使用
+
+        # 5.3 "如果...的话" 特殊处理
+        # 避免在"如果可以的话"中错误添加逗号
+        if '如果' in result and '的话' in result:
+            # 只在"如果...的话"完整结构中，且"的话"后有足够内容时，在"的话"后添加逗号
+            result = re.sub(
+                r'如果(.{2,})的话([\u4e00-\u9fff]{3,})',
+                r'如果\1的话，\2',
+                result,
+                count=1
+            )
+        # 注意：不在"如果"前无条件添加逗号，避免"如果明天..."变成"，如果明天..."
+
+        # ========== 6. 并列关系处理 ==========
+        # "A、B和C" 或 "A、B、C" → 已经有顿号的不处理
+        # 只有在没有顿号但有多个"和"时才转换
+        if '和' in result and '、' not in result:
+            # 检查是否是多项并列（3个或更多的名词用"和"连接）
+            # 但避免简单的"我和你"结构
+            and_count = result.count('和')
+            if and_count >= 2:
+                # 多项并列：A和B和C → A、B、C
+                result = re.sub(r'和', '、', result)
+
+        # ========== 7. 清理多余的标点 ==========
+        result = re.sub(r'，+', '，', result)
+        result = re.sub(r'？+', '？', result)
+        result = re.sub(r'！+', '！', result)
+        result = re.sub(r'^，|，$|^？|？$|^！|！$', '', result)
+
+        return result
+
     def _add_punctuation(self, text: str) -> str:
         """
         添加标点符号
@@ -327,6 +499,67 @@ class TextPostProcessor:
 
         # 默认句号
         return text + '。'
+
+    def _convert_ordinal_numbers(self, text: str) -> str:
+        """
+        转换序数词中的阿拉伯数字为中文数字
+
+        处理规则：
+        - 第1 → 第一
+        - 第2 → 第二
+        - 第10 → 第十
+        - 第23 → 第二十三
+
+        保持已是中文的序数词不变：
+        - 第一 → 第一
+        """
+        # 中文数字映射（0-10，以及百千万亿）
+        digit_map = {
+            '0': '〇', '1': '一', '2': '二', '3': '三', '4': '四',
+            '5': '五', '6': '六', '7': '七', '8': '八', '9': '九',
+            '10': '十',
+        }
+
+        def number_to_chinese(num_str: str) -> str:
+            """将数字字符串转换为中文"""
+            try:
+                num = int(num_str)
+                if num == 0:
+                    return '〇'
+                elif num < 10:
+                    return digit_map[num_str]
+                elif num == 10:
+                    return '十'
+                elif num < 20:
+                    return '十' + digit_map.get(num_str[1], '')
+                elif num < 100:
+                    tens = num // 10
+                    ones = num % 10
+                    result = digit_map[str(tens)] + '十'
+                    if ones > 0:
+                        result += digit_map[str(ones)]
+                    return result
+                else:
+                    # 更大的数字：简单映射
+                    return num_str
+            except:
+                return num_str
+
+        # 匹配 "第" + 阿拉伯数字的模式
+        def replace_ordinal(match):
+            """替换序数词"""
+            number_str = match.group(1)
+            chinese_num = number_to_chinese(number_str)
+            return f"第{chinese_num}"
+
+        # 使用正则表达式查找并替换
+        # 模式：第 + 可选空格 + 一个或多个数字（处理"第2"和"第 2"两种情况）
+        result = re.sub(r'第\s*(\d+)', replace_ordinal, text)
+
+        if result != text:
+            logger.info(f"序数词转换: '{text}' → '{result}'")
+
+        return result
 
     def _convert_chinese_numbers(self, text: str) -> str:
         """
@@ -383,6 +616,14 @@ class TextPostProcessor:
                     return replacer
 
                 protected_text = re.sub(regex_pattern, make_replacer(i, pattern), protected_text)
+
+            # 保护序数词：第[中文数字]（如"第一"、"第二"、"第十"等）
+            ordinal_pattern = r'第[零一二三四五六七八九十百千万亿两〇]+'
+            ordinal_matches = list(re.finditer(ordinal_pattern, protected_text))
+            for idx, match in enumerate(reversed(ordinal_matches), start=len(protected_patterns)):
+                placeholder = f"__PROTECTED_{idx}__"
+                placeholders.append((placeholder, match.group()))
+                protected_text = protected_text[:match.start()] + placeholder + protected_text[match.end():]
 
             # 预处理：将"幺"替换为"一"（只在数字语境下）
             processed_text = protected_text

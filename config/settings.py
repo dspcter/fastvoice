@@ -12,6 +12,7 @@ from .constants import (
     DEFAULT_HOTKEYS,
     DEFAULT_TEXT_PROCESSING,
     DEFAULT_TRANSLATION,
+    DEFAULT_INJECTION,
     get_config_path,
 )
 
@@ -59,6 +60,7 @@ class Settings:
             "translation": DEFAULT_TRANSLATION.copy(),
             "cleanup": DEFAULT_CLEANUP.copy(),
             "text_processing": DEFAULT_TEXT_PROCESSING.copy(),
+            "injection": DEFAULT_INJECTION.copy(),
             "models": {
                 "asr": None,  # 当前使用的 ASR 模型
                 "translation": None,  # 当前使用的翻译模型
@@ -230,6 +232,20 @@ class Settings:
     @use_ai_text_processing.setter
     def use_ai_text_processing(self, value: bool):
         self.set("text_processing.use_ai", value)
+
+    # ==================== 文字注入配置 ====================
+
+    @property
+    def injection_method(self) -> str:
+        """文字注入方式: 'clipboard', 'typing', 'win32_native'"""
+        return self.get("injection.method", DEFAULT_INJECTION["method"])
+
+    @injection_method.setter
+    def injection_method(self, value: str):
+        valid_methods = ["clipboard", "typing", "win32_native"]
+        if value not in valid_methods:
+            raise ValueError(f"注入方式必须是 {valid_methods} 之一")
+        self.set("injection.method", value)
 
 
 # 全局配置实例

@@ -142,6 +142,17 @@ class ASREngine:
                     audio_bytes = wav_file.readframes(frames)
                     samples = np.frombuffer(audio_bytes, dtype=np.int16)
 
+                    # 调试：检查音频数据
+                    rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+                    max_amp = np.max(np.abs(samples))
+                    logger.info(f"ASR 输入音频: frames={frames}, RMS={rms:.2f}, Max={max_amp}")
+
+                    # 检查音频是否太安静
+                    if max_amp < 100:
+                        logger.warning(f"音频信号太弱 (Max={max_amp} < 100)，可能是麦克风音量太低")
+                    if rms < 50:
+                        logger.warning(f"音频平均音量太低 (RMS={rms:.2f} < 50)，可能是环境太安静或说话太小声")
+
                     # 转换为 float32 并归一化
                     samples = samples.astype(np.float32) / 32768.0
 
@@ -166,7 +177,12 @@ class ASREngine:
             result = stream.result
             text = result.text.strip()
 
-            logger.info(f"识别结果: {text}")
+            if text:
+                logger.info(f"识别结果: {text}")
+            else:
+                logger.warning(f"识别结果为空（音频有数据但模型未识别出文字）")
+                logger.warning(f"  可能原因：1) 音频只有噪音/呼吸声 2) 说话太快/含糊 3) 音频时长太短 ({frames/16000:.2f}s)")
+
             return text if text else None
 
         except Exception as e:

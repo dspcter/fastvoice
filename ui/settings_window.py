@@ -86,6 +86,16 @@ class SettingsWindow(QWidget):
         self.init_ui()
         self.load_settings()
 
+    def closeEvent(self, event):
+        """
+        窗口关闭事件 - 只隐藏而不退出应用
+
+        这样可以保持应用在后台运行，快捷键仍然可用
+        """
+        logger.info("设置窗口关闭事件触发，隐藏窗口")
+        self.hide()
+        event.ignore()  # 忽略关闭事件，阻止窗口被销毁
+
     def init_ui(self):
         """初始化 UI"""
         self.setWindowTitle("快人快语 设置")
@@ -115,6 +125,9 @@ class SettingsWindow(QWidget):
 
         # 文本处理
         layout.addWidget(self._create_text_processing_group())
+
+        # 文字注入
+        layout.addWidget(self._create_injection_group())
 
         # 音频管理
         layout.addWidget(self._create_audio_management_group())
@@ -253,6 +266,48 @@ class SettingsWindow(QWidget):
         status = QLabel("文本处理已启用（基于规则）")
         status.setStyleSheet("color: green; font-size: 10px;")
         layout.addWidget(status, 1, 0, 1, 3)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_injection_group(self) -> QGroupBox:
+        """创建文字注入设置组"""
+        group = QGroupBox("文字注入")
+        layout = QGridLayout()
+
+        # 说明文字
+        description = QLabel("选择文字注入方式：")
+        description.setStyleSheet("color: #333; font-size: 11px;")
+        layout.addWidget(description, 0, 0, 1, 3)
+
+        # 注入方式选择
+        layout.addWidget(QLabel("注入方式:"), 1, 0)
+        self.injection_method_combo = QComboBox()
+
+        from config import IS_WINDOWS
+        from core.text_injector import TextInjector
+
+        injector = TextInjector()
+        available_methods = injector.get_available_methods()
+
+        method_names = {
+            "clipboard": "剪贴板 (兼容性好)",
+            "typing": "模拟输入 (支持更多输入法)",
+            "win32_native": "Windows 原生 (不污染剪贴板)"
+        }
+
+        for method in available_methods:
+            self.injection_method_combo.addItem(method_names.get(method, method), method)
+
+        layout.addWidget(self.injection_method_combo, 1, 1)
+
+        # 说明
+        help_text = QLabel(
+            "提示: Windows 原生方式不会污染剪贴板，"
+            "但仅在 Windows 上可用"
+        )
+        help_text.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(help_text, 2, 0, 1, 3)
 
         group.setLayout(layout)
         return group
@@ -492,6 +547,13 @@ class SettingsWindow(QWidget):
         self.auto_cleanup_checkbox.setChecked(self.settings.cleanup_enabled)
         self.cleanup_days_spinbox.setValue(self.settings.cleanup_days)
 
+        # 注入方式
+        current_method = self.settings.injection_method
+        for i in range(self.injection_method_combo.count()):
+            if self.injection_method_combo.itemData(i) == current_method:
+                self.injection_method_combo.setCurrentIndex(i)
+                break
+
         # 模型状态
         self._update_model_status()
 
@@ -511,6 +573,9 @@ class SettingsWindow(QWidget):
             # 音频清理
             self.settings.cleanup_enabled = self.auto_cleanup_checkbox.isChecked()
             self.settings.cleanup_days = self.cleanup_days_spinbox.value()
+
+            # 注入方式
+            self.settings.injection_method = self.injection_method_combo.currentData()
 
             # 保存到文件
             self.settings.save()

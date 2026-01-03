@@ -35,6 +35,7 @@ class AudioCapture:
     VAD_FRAME_DURATION_MS = 30  # 每帧时长 (毫秒)
     VAD_AGGRESSIVENESS = 2      # 激进程度 (0-3)
     MAX_RECORDING_DURATION = 30  # 最大录音时长（秒）- 防止按键释放丢失导致录音卡住
+    MIN_RECORDING_DURATION = 0.2  # 最小录音时长（秒）- 防止按键太短导致没录到音频
 
     def __init__(
         self,
@@ -86,6 +87,10 @@ class AudioCapture:
         self._audio_buffer = []
         self._silence_frames = 0
         self._voice_detected = False
+
+        # 诊断统计
+        self._callback_count = 0  # 回调被调用次数
+        self._last_callback_time: Optional[float] = None  # 最后一次回调时间
 
         # 确保音频目录存在
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -162,10 +167,12 @@ class AudioCapture:
             return True
 
         try:
-            # 重置缓冲
+            # 重置缓冲和统计
             self._audio_buffer = []
             self._silence_frames = 0
             self._voice_detected = False
+            self._callback_count = 0
+            self._last_callback_time = None
             self._recording_start_time = time.time()
             self._is_recording = True  # 先设置为 True，让超时监控可以工作
 
@@ -192,7 +199,6 @@ class AudioCapture:
                     stream_created['done'] = True
 
             # 在线程中创建流，设置 5 秒超时
-            import threading
             create_thread = threading.Thread(target=create_stream, daemon=True)
             create_thread.start()
             create_thread.join(timeout=5.0)
@@ -229,23 +235,41 @@ class AudioCapture:
             return None
 
         try:
+            # 检查录音时长，如果太短则等待
+            if self._recording_start_time:
+                elapsed = time.time() - self._recording_start_time
+                if elapsed < self.MIN_RECORDING_DURATION:
+                    # 等待直到达到最小录音时长
+                    wait_time = self.MIN_RECORDING_DURATION - elapsed
+                    logger.debug(f"录音时长 {elapsed:.3f}s 太短，等待 {wait_time:.3f}s")
+                    time.sleep(wait_time)
+
             # 先保存音频缓冲区和状态，防止后续操作失败
             audio_buffer = self._audio_buffer.copy() if self._audio_buffer else []
+
+            # 计算实际录音时长
+            recording_duration = 0.0
+            if self._recording_start_time:
+                recording_duration = time.time() - self._recording_start_time
+
             self._is_recording = False
             self._recording_start_time = None
 
             # 停止超时监控线程
             self._timeout_thread = None
 
-            logger.debug(f"准备停止音频流，缓冲区有 {len(audio_buffer)} 帧")
+            # 输出诊断信息
+            logger.info(f"停止录音，时长: {recording_duration:.3f}s")
+            logger.info(f"  回调调用次数: {self._callback_count}")
+            logger.info(f"  缓冲区帧数: {len(audio_buffer)}")
+            if self._last_callback_time:
+                time_since_last = time.time() - self._last_callback_time
+                logger.info(f"  最后回调: {time_since_last:.3f}s 前")
 
             # 停止音频流（带超时保护）
             if self._stream:
                 try:
                     # 使用线程来避免阻塞
-                    import threading
-                    import time
-
                     stop_result = {'done': False, 'error': None}
 
                     def stop_stream():
@@ -280,14 +304,34 @@ class AudioCapture:
 
             # 检查是否有音频数据
             if not audio_buffer:
-                logger.warning("没有录制到音频数据")
+                logger.warning(f"❌ 没有录制到音频数据 (录音时长: {recording_duration:.3f}s)")
+                logger.warning(f"诊断信息:")
+                logger.warning(f"  回调调用次数: {self._callback_count}")
+
+                if self._callback_count == 0:
+                    logger.warning(f"  问题: 音频回调从未被调用！")
+                    logger.warning(f"  可能原因:")
+                    logger.warning(f"    1. 音频流创建失败但未报错")
+                    logger.warning(f"    2. 麦克风设备被其他应用占用")
+                    logger.warning(f"    3. 麦克风驱动程序问题")
+                    logger.warning(f"  建议: 尝试重启应用或更换麦克风设备")
+                else:
+                    logger.warning(f"  问题: 回调被调用了 {self._callback_count} 次，但缓冲区为空！")
+                    logger.warning(f"  可能原因:")
+                    logger.warning(f"    1. 回调函数抛出异常")
+                    logger.warning(f"    2. 内存不足")
+                    logger.warning(f"    3. 音频流内部错误")
+
                 return None
 
             # 转换为 WAV 格式
             logger.debug("开始转换音频为 WAV 格式")
             wav_data = self._convert_to_wav(audio_buffer)
 
-            logger.info(f"停止录音，共 {len(audio_buffer)} 帧")
+            # 计算音频时长
+            audio_duration = len(audio_buffer) * self.VAD_FRAME_DURATION_MS / 1000
+            logger.info(f"录音完成: 时长 {recording_duration:.2f}s, 音频 {audio_duration:.2f}s, {len(audio_buffer)} 帧")
+
             return wav_data
 
         except Exception as e:
@@ -307,17 +351,29 @@ class AudioCapture:
             time_info: 时间信息
             status: 状态
         """
-        if status:
-            logger.warning(f"音频流状态: {status}")
+        try:
+            # 更新统计信息
+            self._callback_count += 1
+            self._last_callback_time = time.time()
 
-        # 转换为 bytes
-        audio_bytes = indata.tobytes()
+            if status:
+                logger.warning(f"音频流状态: {status}")
 
-        # 添加到队列（用于音量检测等）
-        self._audio_queue.put(audio_bytes)
+            # 转换为 bytes
+            audio_bytes = indata.tobytes()
 
-        # 直接添加到音频缓冲区
-        self._audio_buffer.append(audio_bytes)
+            # 添加到队列（用于音量检测等）
+            self._audio_queue.put(audio_bytes)
+
+            # 直接添加到音频缓冲区
+            self._audio_buffer.append(audio_bytes)
+
+            # 每 100 次回调输出一次日志（约每 3 秒）
+            if self._callback_count % 100 == 0:
+                logger.debug(f"音频回调已调用 {self._callback_count} 次，缓冲区大小: {len(self._audio_buffer)}")
+
+        except Exception as e:
+            logger.error(f"音频回调异常: {e}，但继续录音")
 
     def _convert_to_wav(self, audio_frames: list) -> bytes:
         """

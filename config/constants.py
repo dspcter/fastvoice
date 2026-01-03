@@ -67,6 +67,11 @@ DEFAULT_TEXT_PROCESSING = {
     "use_ai": False,  # 默认不使用 AI，使用简单规则
 }
 
+# 文字注入默认配置
+DEFAULT_INJECTION = {
+    "method": "win32_native" if IS_WINDOWS else "clipboard",  # Windows 优先使用原生注入
+}
+
 # ==================== 模型信息 ====================
 # ASR 模型 (sherpa-onnx + SenseVoice) - 闪电说同款方案
 ASR_MODELS = {
