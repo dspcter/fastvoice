@@ -325,6 +325,12 @@ class TextPostProcessor:
         # 清理多余空格
         result = re.sub(r'  +', ' ', result)
 
+        # 后处理：移除阿拉伯数字和中文单位/量词之间的空格
+        # 2 万 → 2万
+        # 100 个 → 100个
+        # 但保留合理空格：I have 2 apples（英文中间的空格保留）
+        result = re.sub(r'(\d+)\s+([个万千百亿十本本书条张件台套双对只支瓶盒袋份位岁级])', r'\1\2', result)
+
         return result
 
     def _fix_english_capitalization(self, text: str) -> str:
@@ -590,6 +596,18 @@ class TextPostProcessor:
                 '万一', '唯一', '第一', '统一', '一切', '一向',
                 '一处', '一点', '一种', '个个', '同时',
             ]
+
+            # 保护"中文数字 + 数字单位"的模式（万、千、百等）
+            # "两万"、"三亿"、"四千" 等应保留中文
+            for num in '一二三四五六七八九十两〇':
+                for unit in '万千百亿兆':
+                    protected_patterns.append(f'{num}{unit}')
+
+            # 保护"中文数字 + 量词"的模式（个、人、本、书等）
+            # "一个人"、"三个人"、"五本书" 等应保留中文
+            for num in '一二三四五六七八九十两':
+                for quantifier in '个天人本本书条张件台套双对只支瓶盒袋份位岁级群':
+                    protected_patterns.append(f'{num}{quantifier}')
 
             # 去重并排序（长的模式优先匹配）
             protected_patterns = sorted(list(set(protected_patterns)), key=len, reverse=True)
