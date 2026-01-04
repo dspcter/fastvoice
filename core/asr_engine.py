@@ -14,6 +14,18 @@ from models import get_model_manager, ModelType
 logger = logging.getLogger(__name__)
 
 
+# ==================== 异常定义 ====================
+
+class ASRSilentError(Exception):
+    """ASR 静音错误：音频信号太弱，无法识别"""
+    pass
+
+
+class ASREmptyResult(Exception):
+    """ASR 空结果：模型未识别出文字（音频太短或无有效语音）"""
+    pass
+
+
 class ASREngine:
     """
     语音识别引擎
@@ -145,13 +157,18 @@ class ASREngine:
                     # 调试：检查音频数据
                     rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
                     max_amp = np.max(np.abs(samples))
-                    logger.info(f"ASR 输入音频: frames={frames}, RMS={rms:.2f}, Max={max_amp}")
+                    duration = frames / sample_rate
 
-                    # 检查音频是否太安静
+                    logger.info("ASR 输入音频: frames=%d, RMS=%.2f, Max=%.2f, 时长=%.2fs",
+                               frames, rms, max_amp, duration)
+
+                    # 检查音频是否太安静（静音）
                     if max_amp < 100:
-                        logger.warning(f"音频信号太弱 (Max={max_amp} < 100)，可能是麦克风音量太低")
-                    if rms < 50:
-                        logger.warning(f"音频平均音量太低 (RMS={rms:.2f} < 50)，可能是环境太安静或说话太小声")
+                        raise ASRSilentError(f"音频信号太弱 (Max={max_amp} < 100)，请检查麦克风音量")
+
+                    # 检查音频是否太短
+                    if duration < 0.5:
+                        raise ASREmptyResult(f"音频太短 ({duration:.2f}s < 0.5s)")
 
                     # 转换为 float32 并归一化
                     samples = samples.astype(np.float32) / 32768.0
@@ -179,15 +196,17 @@ class ASREngine:
 
             if text:
                 logger.info(f"识别结果: {text}")
+                return text
             else:
-                logger.warning(f"识别结果为空（音频有数据但模型未识别出文字）")
-                logger.warning(f"  可能原因：1) 音频只有噪音/呼吸声 2) 说话太快/含糊 3) 音频时长太短 ({frames/16000:.2f}s)")
+                # 模型未识别出文字（但音频质量合格）
+                raise ASREmptyResult("模型未识别出有效文字（可能是噪音/含糊说话）")
 
-            return text if text else None
-
+        except (ASRSilentError, ASREmptyResult):
+            # 自定义异常重新抛出，让上层处理
+            raise
         except Exception as e:
-            logger.error(f"识别音频数据失败: {e}")
-            return None
+            # 其他异常包装后抛出
+            raise RuntimeError(f"ASR 识别失败: {e}") from e
 
     def _load_audio_file(self, audio_file: Path) -> Optional[np.ndarray]:
         """

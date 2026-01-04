@@ -7,11 +7,13 @@
 
 import logging
 import sys
+import threading
+from enum import Enum
 from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QWidget
 from PyQt6.QtGui import QIcon, QAction
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, pyqtSignal, QObject
 
 # 添加项目根目录到 Python 路径
 PROJECT_ROOT = Path(__file__).parent
@@ -37,27 +39,76 @@ from core import (
     get_text_postprocessor,
     get_marianmt_engine,
 )
+from core.asr_worker import ASRWorker
+from core.memory_manager import get_memory_manager
 from models import get_model_manager, ModelType
 from ui import SettingsWindow
 
-# 配置日志
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format=LOG_FORMAT,
-    datefmt=LOG_DATE_FORMAT,
-    handlers=[
-        logging.FileHandler(get_log_path(), encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
 
+class AppState(Enum):
+    """
+    应用状态机
+
+    状态转换:
+    IDLE → VOICE_RECORDING → FINALIZING → IDLE
+    IDLE → TRANSLATE_RECORDING → FINALIZING → IDLE
+    """
+    IDLE = "idle"                           # 空闲，无录音
+    VOICE_RECORDING = "voice_recording"     # 语音输入录音中
+    TRANSLATE_RECORDING = "translate_recording"  # 翻译录音中
+    FINALIZING = "finalizing"               # 处理中（ASR/翻译）
+
+# 配置日志
+def setup_logging():
+    """配置日志系统（带滚动）"""
+    from logging.handlers import RotatingFileHandler
+
+    # 确保日志目录存在
+    log_path = get_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 创建滚动文件处理器（单个文件最大 10MB，保留 3 个备份）
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=3,
+        encoding='utf-8',
+    )
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+
+    # 配置根日志记录器
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, LOG_LEVEL))
+    root_logger.handlers.clear()  # 清除现有处理器
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    return file_handler  # 返回以便后续使用
+
+
+# 初始化日志
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
-class FastVoiceApp:
+class FastVoiceApp(QObject):
     """快人快语主应用类"""
 
+    # 定义信号（跨线程调用）
+    _asr_result_signal = pyqtSignal(str)  # ASR 识别结果
+    _asr_error_signal = pyqtSignal()  # ASR 错误（回到 IDLE）
+
     def __init__(self):
+        super().__init__()  # 必须调用 QObject 的 __init__
+
+        # 连接信号到槽（跨线程调用）
+        self._asr_result_signal.connect(self._handle_asr_result_on_main_thread)
+        self._asr_error_signal.connect(self._return_to_idle)
+
         self.settings = get_settings()
         self.hotkey_manager = HotkeyManager()
         self.audio_capture = None
@@ -65,6 +116,15 @@ class FastVoiceApp:
         self.text_injector = get_text_injector(method=self.settings.injection_method)
         self.text_postprocessor = get_text_postprocessor()
         self.model_manager = get_model_manager()
+
+        # ASR Worker - 异步处理
+        self.asr_worker = ASRWorker(
+            on_result=self._on_asr_result,
+            on_error=self._on_asr_error
+        )
+
+        # 内存管理器 - 防止内存泄漏
+        self.memory_manager = get_memory_manager()
 
         # MarianMT 翻译引擎（按需加载）
         self._marianmt_engines = {}
@@ -75,15 +135,120 @@ class FastVoiceApp:
         # 设置窗口
         self.settings_window = None
 
-        # 录音状态
-        self._is_recording = False
-        self._is_translating = False
-        self._translate_capture = None  # 翻译用的音频采集器
+        # 状态机（替代布尔标志）
+        self._state = AppState.IDLE
+        self._state_lock = threading.RLock()  # 可重入锁，防止死锁
+        self._current_audio_capture = None  # 当前录音采集器
+        self._current_translate = False  # 当前任务是否需要翻译
 
         logger.info(f"{APP_NAME} v{VERSION} 初始化完成")
 
+    def _transition_state(self, new_state: AppState) -> bool:
+        """
+        状态转换（线程安全）
+
+        Args:
+            new_state: 新状态
+
+        Returns:
+            是否转换成功
+        """
+        with self._state_lock:
+            old_state = self._state
+
+            # 检查状态转换是否合法
+            if new_state == AppState.VOICE_RECORDING and old_state != AppState.IDLE:
+                logger.warning(f"非法状态转换: {old_state.value} → {new_state.value}")
+                return False
+
+            if new_state == AppState.TRANSLATE_RECORDING and old_state != AppState.IDLE:
+                logger.warning(f"非法状态转换: {old_state.value} → {new_state.value}")
+                return False
+
+            self._state = new_state
+            logger.info(f"状态转换: {old_state.value} → {new_state.value}")
+            return True
+
+    def _get_state(self) -> AppState:
+        """获取当前状态（线程安全）"""
+        with self._state_lock:
+            return self._state
+
+    def _finalize_recording(self, audio_data: bytes = None, force: bool = False):
+        """
+        统一的录音结束处理（幂等）
+
+        on_auto_stop 和 on_release 都调用这个函数
+
+        Args:
+            audio_data: 音频数据（如果已提供）
+            force: 是否强制执行（忽略状态检查）
+        """
+        with self._state_lock:
+            if not force and self._state == AppState.IDLE:
+                return  # 已经是 IDLE，幂等返回
+
+            if self._state not in [AppState.VOICE_RECORDING, AppState.TRANSLATE_RECORDING]:
+                logger.warning(f"当前状态不允许 finalize: {self._state.value}")
+                return
+
+            # 转换到 FINALIZING 状态
+            old_state = self._state
+            self._state = AppState.FINALIZING
+
+        logger.info(f"结束录音，当前状态: {old_state.value}")
+
+        # 停止录音并获取音频数据
+        if audio_data is None and self._current_audio_capture:
+            try:
+                audio_data = self._current_audio_capture.stop_recording()
+            except Exception as e:
+                logger.error(f"停止录音失败: {e}")
+                audio_data = None
+
+        # 保存音频文件
+        if audio_data:
+            try:
+                filepath = self._current_audio_capture.save_audio(audio_data)
+                logger.info(f"音频已保存: {filepath}")
+            except Exception as e:
+                logger.error(f"保存音频失败: {e}")
+
+        # 提交到 ASR Worker 异步处理
+        if audio_data:
+            try:
+                self._current_translate = (old_state == AppState.TRANSLATE_RECORDING)
+                self.asr_worker.process_audio(audio_data)
+            except Exception as e:
+                logger.error(f"提交 ASR 任务失败: {e}")
+                # 异常时立即回到 IDLE
+                with self._state_lock:
+                    self._state = AppState.IDLE
+        else:
+            logger.warning("没有录制到音频")
+            # 直接回到 IDLE
+            with self._state_lock:
+                self._state = AppState.IDLE
+
+        # 最后清理录音采集器（确保状态已处理完毕）
+        self._current_audio_capture = None
+
     def initialize(self):
         """初始化应用"""
+        # 启动 ASR Worker 并预热模型
+        logger.info("启动 ASR Worker...")
+        if not self.asr_worker.start():
+            logger.error("ASR Worker 启动失败")
+            return False
+
+        logger.info("预热 ASR 模型...")
+        if not self.asr_worker.warmup():
+            logger.warning("ASR 模型预热失败，首次识别可能较慢")
+
+        # 启动内存自动清理
+        logger.info("启动内存自动清理...")
+        self.memory_manager.start_auto_cleanup()
+
         # 注册快捷键回调
         self.hotkey_manager.register_callback(
             HotkeyAction.VOICE_INPUT_PRESS, self._on_voice_press
@@ -112,113 +277,117 @@ class FastVoiceApp:
 
     def _on_voice_press(self):
         """语音输入按键按下 - 开始录音"""
-        if self._is_recording:
-            return
+        try:
+            # 检查状态，只允许从 IDLE 转换到 RECORDING
+            if not self._transition_state(AppState.VOICE_RECORDING):
+                logger.warning("当前状态不允许开始录音: %s", self._get_state().value)
+                return
 
-        # 安全检查：如果 audio_capture 存在但未在录音，重置状态
-        if self.audio_capture and not self.audio_capture.is_recording():
-            logger.debug("清理异常状态：audio_capture 存在但未录音")
-            self._is_recording = False
+            logger.info("开始录音 (语音输入)")
 
-        logger.info("开始录音 (语音输入)")
-        self._is_recording = True
+            # P0: 递增 generation，使旧任务失效
+            self.asr_worker.start_session()
 
-        # 创建音频采集器，传入自动停止回调
-        def on_auto_stop(audio_data: bytes):
-            """录音超时自动停止时的处理"""
-            logger.info("录音自动停止（超时）")
-            self._is_recording = False
-            # 保存音频文件
-            filepath = self.audio_capture.save_audio(audio_data)
-            # 语音识别并直接注入原文
-            self._process_voice_input(audio_data, translate=False)
+            # 创建音频采集器，传入自动停止回调
+            def on_auto_stop(audio_data: bytes):
+                """录音超时自动停止时的处理"""
+                logger.info("录音自动停止（超时）")
+                self._finalize_recording(audio_data)
 
-        self.audio_capture = AudioCapture(
-            sample_rate=self.settings.sample_rate,
-            vad_threshold=self.settings.vad_threshold,
-            device=self.settings.microphone_device or None,
-            on_auto_stop=on_auto_stop,
-        )
+            self._current_audio_capture = AudioCapture(
+                sample_rate=self.settings.sample_rate,
+                vad_threshold=self.settings.vad_threshold,
+                device=self.settings.microphone_device or None,
+                on_auto_stop=on_auto_stop,
+            )
 
-        # 开始录音
-        self.audio_capture.start_recording()
+            # 开始录音
+            self._current_audio_capture.start_recording()
+
+        except Exception as e:
+            logger.error(f"启动录音失败: {e}")
+            # 异常时强制回到 IDLE
+            with self._state_lock:
+                self._state = AppState.IDLE
+            self._current_audio_capture = None
 
     def _on_voice_release(self):
         """语音输入按键释放 - 停止录音并识别"""
-        if not self._is_recording:
-            return
+        try:
+            # 检查状态
+            current_state = self._get_state()
+            if current_state != AppState.VOICE_RECORDING:
+                return
 
-        logger.info("停止录音 (语音输入)")
-        self._is_recording = False
+            logger.info("停止录音 (语音输入)")
+            # 调用统一的 finalize 函数
+            self._finalize_recording()
 
-        # 停止录音
-        audio_data = self.audio_capture.stop_recording()
-
-        if audio_data:
-            # 保存音频文件
-            filepath = self.audio_capture.save_audio(audio_data)
-
-            # 语音识别并直接注入原文
-            self._process_voice_input(audio_data, translate=False)
-        else:
-            logger.warning("没有录制到音频")
+        except Exception as e:
+            logger.error(f"停止录音失败: {e}")
+            # 异常时强制回到 IDLE
+            with self._state_lock:
+                self._state = AppState.IDLE
+            self._current_audio_capture = None
 
     def _on_translate_press(self):
         """翻译按键按下 - 开始录音用于翻译"""
-        if self._is_translating:
-            return
+        try:
+            # 检查状态，只允许从 IDLE 转换到 RECORDING
+            if not self._transition_state(AppState.TRANSLATE_RECORDING):
+                logger.warning("当前状态不允许开始翻译录音: %s", self._get_state().value)
+                return
 
-        # 安全检查：如果 _translate_capture 存在但未在录音，重置状态
-        if self._translate_capture and not self._translate_capture.is_recording():
-            logger.debug("清理异常状态：_translate_capture 存在但未录音")
-            self._is_translating = False
+            logger.info("开始录音 (翻译)")
 
-        logger.info("开始录音 (翻译)")
-        self._is_translating = True
+            # P0: 递增 generation，使旧任务失效
+            self.asr_worker.start_session()
 
-        # 创建音频采集器，传入自动停止回调
-        def on_auto_stop(audio_data: bytes):
-            """录音超时自动停止时的处理"""
-            logger.info("翻译录音自动停止（超时）")
-            self._is_translating = False
-            # 保存音频文件
-            filepath = self._translate_capture.save_audio(audio_data)
-            # 语音识别并翻译
-            self._process_voice_input(audio_data, translate=True)
+            # 创建音频采集器，传入自动停止回调
+            def on_auto_stop(audio_data: bytes):
+                """录音超时自动停止时的处理"""
+                logger.info("翻译录音自动停止（超时）")
+                self._finalize_recording(audio_data)
 
-        self._translate_capture = AudioCapture(
-            sample_rate=self.settings.sample_rate,
-            vad_threshold=self.settings.vad_threshold,
-            device=self.settings.microphone_device or None,
-            on_auto_stop=on_auto_stop,
-        )
+            self._current_audio_capture = AudioCapture(
+                sample_rate=self.settings.sample_rate,
+                vad_threshold=self.settings.vad_threshold,
+                device=self.settings.microphone_device or None,
+                on_auto_stop=on_auto_stop,
+            )
 
-        # 开始录音
-        self._translate_capture.start_recording()
+            # 开始录音
+            self._current_audio_capture.start_recording()
+
+        except Exception as e:
+            logger.error(f"启动翻译录音失败: {e}")
+            # 异常时强制回到 IDLE
+            with self._state_lock:
+                self._state = AppState.IDLE
+            self._current_audio_capture = None
 
     def _on_translate_release(self):
         """翻译按键释放 - 停止录音并翻译"""
-        if not self._is_translating:
-            return
+        try:
+            # 检查状态
+            current_state = self._get_state()
+            if current_state != AppState.TRANSLATE_RECORDING:
+                return
 
-        logger.info("停止录音 (翻译)")
-        self._is_translating = False
+            logger.info("停止录音 (翻译)")
+            # 调用统一的 finalize 函数
+            self._finalize_recording()
 
-        # 停止录音
-        audio_data = self._translate_capture.stop_recording()
-
-        if audio_data:
-            # 保存音频文件
-            filepath = self._translate_capture.save_audio(audio_data)
-
-            # 语音识别并翻译
-            self._process_voice_input(audio_data, translate=True)
-        else:
-            logger.warning("没有录制到音频")
+        except Exception as e:
+            logger.error(f"停止翻译录音失败: {e}")
+            # 异常时强制回到 IDLE
+            with self._state_lock:
+                self._state = AppState.IDLE
+            self._current_audio_capture = None
 
     def _process_voice_input(self, audio_data: bytes, translate: bool = False):
         """
-        处理语音输入
+        处理语音输入 - 异步提交到 ASR Worker
 
         Args:
             audio_data: 音频数据
@@ -236,62 +405,12 @@ class FastVoiceApp:
         except:
             audio_duration = 0.0
 
-        # 语音识别
-        logger.info(f"开始语音识别，音频数据大小: {len(audio_data)} bytes，时长约 {audio_duration:.2f}s")
-        text = self.asr_engine.recognize_bytes(audio_data)
-        logger.info(f"ASR 引擎返回: {repr(text)} (类型: {type(text)})")
+        logger.info(f"提交语音识别任务，音频数据大小: {len(audio_data)} bytes，时长约 {audio_duration:.2f}s")
 
-        if text:
-            # 文本后处理：去除语气词、添加标点、梳理逻辑
-            processed_text = self.text_postprocessor.process(text)
-            self._last_recognized_text = processed_text
-            logger.info(f"识别结果: {text}")
-            logger.info(f"后处理结果: {processed_text}")
-            logger.info(f"准备注入文字: '{processed_text}'")
-
-            # 如果需要翻译
-            if translate:
-                target_lang = self.settings.target_language
-                source_lang = self.settings.source_language
-
-                # 确定翻译方向
-                direction = f"{source_lang}-{target_lang}"
-
-                logger.info(f"翻译: {source_lang} → {target_lang}")
-
-                # 获取对应的 MarianMT 引擎
-                engine_key = direction
-
-                if engine_key not in self._marianmt_engines:
-                    # 检查模型是否已下载
-                    model_id = f"marianmt-{direction}"
-                    if not self.model_manager.check_translation_model(model_id):
-                        logger.warning(f"翻译模型 {model_id} 未下载，请在设置中下载")
-                        self.text_injector.inject(processed_text)
-                        return
-
-                    # 创建翻译引擎
-                    self._marianmt_engines[engine_key] = get_marianmt_engine(direction)
-
-                # 执行翻译
-                engine = self._marianmt_engines[engine_key]
-                translated = engine.translate(processed_text)
-
-                if translated:
-                    self.text_injector.inject(translated)
-                else:
-                    logger.warning("翻译失败，注入原文")
-                    self.text_injector.inject(processed_text)
-            else:
-                # 直接注入处理后的文本
-                self.text_injector.inject(processed_text)
-        else:
-            # 提供更详细的失败原因
-            if audio_duration < 0.3:
-                logger.warning(f"语音识别失败：音频太短 ({audio_duration:.2f}s < 0.3s)，请说话时间长一点")
-            else:
-                logger.warning(f"语音识别失败：ASR 引擎返回空值 (音频时长: {audio_duration:.2f}s)")
-                logger.warning(f"  可能原因：1) 音频中没有清晰的语音内容 2) 麦克风音量太低 3) 环境噪音太大")
+        # 提交到 ASR Worker 异步处理（不阻塞 UI）
+        # 注意：翻译逻辑暂时在 _on_asr_result 回调中处理
+        self._current_translate = translate  # 保存翻译标志
+        self.asr_worker.process_audio(audio_data)
 
     def show_settings(self):
         """显示设置窗口"""
@@ -318,11 +437,152 @@ class FastVoiceApp:
         # 停止快捷键监听
         self.hotkey_manager.stop()
 
-        # 停止录音
-        if self.audio_capture and self.audio_capture.is_recording():
-            self.audio_capture.stop_recording()
+        # 停止 ASR Worker
+        self.asr_worker.stop()
+
+        # 停止内存自动清理
+        self.memory_manager.stop_auto_cleanup()
+
+        # 停止录音（如果正在录音）
+        if self._current_audio_capture and self._current_audio_capture.is_recording():
+            self._current_audio_capture.stop_recording()
 
         logger.info("应用已关闭")
+
+    def _on_asr_result(self, text: str):
+        """
+        ASR Worker 识别结果回调（在 worker 线程执行）
+
+        P0 线程安全：发射信号到主线程执行
+
+        Args:
+            text: 识别出的文本
+        """
+        try:
+            if not text:
+                logger.debug("ASR 识别结果为空")
+                # 空结果也要回到 IDLE
+                self._asr_error_signal.emit()
+                return
+
+            # 发射信号到主线程（Qt 信号是线程安全的）
+            logger.info("发射 ASR 结果信号: '%s'", text)
+            self._asr_result_signal.emit(text)
+
+        except Exception as e:
+            logger.error("ASR 结果处理失败: %s", e)
+            self._asr_error_signal.emit()
+
+    def _handle_asr_result_on_main_thread(self, text: str):
+        """
+        在主线程处理 ASR 结果（线程安全）
+
+        P0: 此函数在主线程执行，可以安全调用 UI 操作
+
+        Args:
+            text: 识别出的文本
+        """
+        try:
+            # 文本后处理
+            processed_text = self.text_postprocessor.process(text)
+            self._last_recognized_text = processed_text
+
+            logger.info("ASR 识别结果: %s", text)
+            logger.info("后处理结果: %s", processed_text)
+
+            # 如果需要翻译
+            if self._current_translate:
+                final_text = self._translate_text(processed_text)
+            else:
+                final_text = processed_text
+
+            # 注入文字（现在在主线程，安全）
+            logger.info("准备注入文字: '%s'", final_text)
+            self.text_injector.inject(final_text)
+
+        except Exception as e:
+            logger.error("处理 ASR 结果失败: %s", e)
+        finally:
+            # 无论成功失败，都要回到 IDLE（在主线程）
+            self._return_to_idle()
+
+    def _return_to_idle(self):
+        """回到 IDLE 状态（在主线程调用）"""
+        with self._state_lock:
+            if self._state == AppState.FINALIZING:
+                self._state = AppState.IDLE
+                logger.info("处理完成，状态回到 IDLE")
+
+    def _on_asr_error(self, error: Exception):
+        """
+        ASR Worker 错误回调（在 worker 线程执行）
+
+        P0: 发射信号到主线程恢复状态
+
+        Args:
+            error: 异常对象
+        """
+        logger.error("ASR Worker 错误: %s", error)
+
+        # 判断异常类型并给出提示
+        from core.asr_engine import ASRSilentError, ASREmptyResult
+
+        if isinstance(error, ASRSilentError):
+            logger.warning("提示: 请检查麦克风音量")
+        elif isinstance(error, ASREmptyResult):
+            logger.debug("音频太短或无有效语音")
+
+        # 错误时也要回到 IDLE（发射信号到主线程）
+        self._asr_error_signal.emit()
+
+    def _translate_text(self, text: str) -> str:
+        """
+        翻译文本（在主线程执行，因为 _handle_asr_result_on_main_thread 在主线程）
+
+        注意：翻译模型加载和执行都是同步操作，但因为已经通过 QTimer 调度到主线程，
+        所以不会阻塞 ASR worker 线程。
+
+        Args:
+            text: 要翻译的文本
+
+        Returns:
+            翻译结果，失败则返回原文
+        """
+        try:
+            target_lang = self.settings.target_language
+            source_lang = self.settings.source_language
+
+            # 确定翻译方向
+            direction = f"{source_lang}-{target_lang}"
+
+            logger.info(f"翻译: {source_lang} → {target_lang}")
+
+            # 获取对应的 MarianMT 引擎
+            engine_key = direction
+
+            if engine_key not in self._marianmt_engines:
+                # 检查模型是否已下载
+                model_id = f"marianmt-{direction}"
+                if not self.model_manager.check_translation_model(model_id):
+                    logger.warning(f"翻译模型 {model_id} 未下载，请在设置中下载")
+                    return text  # 返回原文
+
+                # 创建翻译引擎
+                self._marianmt_engines[engine_key] = get_marianmt_engine(direction)
+
+            # 执行翻译
+            engine = self._marianmt_engines[engine_key]
+            translated = engine.translate(text)
+
+            if translated:
+                return translated
+            else:
+                logger.warning("翻译失败，返回原文")
+                return text
+
+        except Exception as e:
+            logger.error(f"翻译异常: {e}，返回原文")
+            return text
 
 
 def create_menu_bar(app: FastVoiceApp, qt_app: QApplication):
@@ -480,42 +740,33 @@ def main():
 
     def heartbeat():
         heartbeat_count[0] += 1
-        logger.info(f"🫀 应用心跳: 运行中 {heartbeat_count[0] * 60} 秒")
 
-        # 获取详细状态
+        # 使用 lazy logging 避免字符串累积（只在真正需要输出时才格式化）
+        # 合并日志减少对象创建
         watchdog_alive = app.hotkey_manager.is_watchdog_alive()
         listener_status = app.hotkey_manager.get_listener_status()
+        memory_stats = app.memory_manager.get_stats()
 
-        logger.info(f"   系统状态:")
-        logger.info(f"     Watchdog: {'✓ 运行中' if watchdog_alive else '✗ 已停止'}")
-        logger.info(f"     Listener: {listener_status['health']}")
-        logger.info(f"       - 线程存活: {'是' if listener_status['thread_alive'] else '否'}")
-        logger.info(f"       - 距上次按键: {listener_status['seconds_since_last_key_event']:.0f} 秒")
-        logger.info(f"       - 检测到的按键数: {listener_status['total_keys_detected']}")
+        # 单行日志输出 - 使用 lazy logging
+        logger.info(
+            "心跳 %ds | Watchdog:%s Listener:%s(%.0fs) 内存:%.1fMB",
+            heartbeat_count[0] * 60,
+            '✓' if watchdog_alive else '✗',
+            listener_status['health'][0] if listener_status['thread_alive'] else '✗',
+            listener_status['seconds_since_last_key_event'],
+            memory_stats['memory_mb']
+        )
 
-        # 如果 watchdog 死了，尝试恢复
-        if not watchdog_alive:
-            logger.error("❌ Watchdog 已停止响应！尝试恢复...")
-            try:
-                # 重启 watchdog
-                app.hotkey_manager._start_watchdog()
-                logger.info("✓ Watchdog 已恢复")
-            except Exception as e:
-                logger.error(f"✗ Watchdog 恢复失败: {e}")
+        # 检查是否需要恢复
+        need_recovery = (
+            not watchdog_alive or
+            not listener_status['thread_alive'] or
+            listener_status['health'] == '可能已静默失效'
+        )
 
-        # 如果 listener 线程死了，watchdog 应该会自动重启它
-        # 但如果 watchdog 也死了，我们需要手动重启整个系统
-        if not listener_status['thread_alive'] and not watchdog_alive:
-            logger.error("❌ Listener 和 Watchdog 都已停止！尝试完全恢复...")
-            try:
-                app.hotkey_manager.stop()
-                app.hotkey_manager.start(
-                    app.settings.voice_input_hotkey,
-                    app.settings.quick_translate_hotkey
-                )
-                logger.info("✓ 快捷键系统已恢复")
-            except Exception as e:
-                logger.error(f"✗ 快捷键系统恢复失败: {e}")
+        if need_recovery:
+            logger.warning("检测到系统异常，尝试自动恢复...")
+            app.hotkey_manager.recover()
 
     heartbeat_timer.timeout.connect(heartbeat)
     heartbeat_timer.start(60000)  # 60 秒

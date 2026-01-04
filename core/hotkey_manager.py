@@ -335,15 +335,18 @@ class HotkeyManager:
 
                     current_time = time.time()
 
-                    # 每 60 秒输出一次心跳日志
+                    # 每 60 秒输出一次心跳日志 - 使用 lazy logging
                     if self._watchdog_loop_count % 60 == 0:
-                        listener_status = "未知"
+                        listener_alive = False
                         if self._listener:
                             try:
-                                listener_status = "运行中" if self._listener.is_alive() else "已死亡"
+                                listener_alive = self._listener.is_alive()
                             except:
-                                listener_status = "检查失败"
-                        logger.info(f"🐕 Watchdog 心跳: 运行 {self._watchdog_loop_count}s, Listener: {listener_status}")
+                                listener_alive = False
+                        # 使用 lazy logging 避免字符串累积
+                        logger.info("Watchdog %ds | Listener:%s",
+                                   self._watchdog_loop_count,
+                                   '✓' if listener_alive else '✗')
 
                     # 定期检查 listener 健康状态
                     if current_time - last_listener_check > self.LISTENER_HEALTH_CHECK_INTERVAL:
@@ -404,7 +407,8 @@ class HotkeyManager:
             name="HotkeyWatchdog"
         )
         self._watchdog_thread.start()
-        logger.info(f"Watchdog 已启动 (超时: {self.WATCHDOG_TIMEOUT_S}s, Listener检查: {self.LISTENER_HEALTH_CHECK_INTERVAL}s, 心跳日志: 每60s)")
+        logger.info("Watchdog 已启动 (超时: %ds, Listener检查: %ds, 心跳日志: 每60s)",
+                   self.WATCHDOG_TIMEOUT_S, self.LISTENER_HEALTH_CHECK_INTERVAL)
 
     def is_watchdog_alive(self) -> bool:
         """
@@ -776,6 +780,73 @@ class HotkeyManager:
             return self._listener.is_alive()  # 是方法调用，不是属性
         except:
             return False
+
+    def recover(self) -> bool:
+        """
+        一键恢复：检查并恢复 listener 和 watchdog
+
+        这是一个幂等操作，可以多次调用
+
+        Returns:
+            是否恢复成功
+        """
+        logger.info("开始一键恢复快捷键系统...")
+        success = True
+
+        # 检查并恢复 watchdog
+        if not self.is_watchdog_alive():
+            logger.warning("Watchdog 未运行，尝试重启...")
+            if not self.restart_watchdog():
+                success = False
+
+        # 检查并恢复 listener
+        listener_status = self.get_listener_status()
+        if not listener_status['thread_alive'] or listener_status['health'] == '可能已静默失效':
+            logger.warning(f"Listener 状态异常 ({listener_status['health']})，尝试重启...")
+            if not self.restart_listener():
+                success = False
+
+        if success:
+            logger.info("✓ 快捷键系统恢复成功")
+        else:
+            logger.error("✗ 快捷键系统恢复失败")
+
+        return success
+
+    def restart_watchdog(self) -> bool:
+        """
+        重启 watchdog（幂等操作）
+
+        可以多次调用，不会重复创建
+
+        Returns:
+            是否重启成功
+        """
+        try:
+            # 先停止现有的 watchdog
+            self._stop_watchdog()
+
+            # 启动新的 watchdog
+            self._start_watchdog()
+
+            logger.info("✓ Watchdog 重启成功")
+            return True
+
+        except Exception as e:
+            logger.error(f"✗ Watchdog 重启失败: {e}")
+            return False
+
+    def restart_listener(self) -> bool:
+        """
+        重启 listener（幂等操作，带重试）
+
+        可以多次调用，会安全地停止旧 listener 并启动新 listener
+
+        Returns:
+            是否重启成功
+        """
+        # 复用现有的 _restart_listener 方法（已包含重试逻辑）
+        return self._restart_listener()
 
 
 # ==================== 使用示例 ====================

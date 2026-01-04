@@ -74,6 +74,9 @@ class ASRWorker:
         self._current_session_segments: List[bytes] = []
         self._session_lock = threading.Lock()
 
+        # P0: 任务幂等机制 - generation_id
+        self._generation = 0  # 当前任务代号，每次 start_session 递增
+
         # 统计
         self._total_processed = 0
         self._total_segments = 0
@@ -145,15 +148,29 @@ class ASRWorker:
 
         logger.info("ASRWorker 已停止")
 
+    def restart(self) -> bool:
+        """
+        重启 ASR Worker（幂等操作）
+
+        Returns:
+            是否重启成功
+        """
+        logger.info("重启 ASRWorker...")
+        self.stop()
+        return self.start()
+
     def start_session(self) -> None:
         """
         开始新的识别会话
 
-        每次按键按下时调用，重置会话状态
+        每次按键按下时调用，重置会话状态并递增 generation
+
+        P0 幂等机制：递增 generation，使旧任务失效
         """
         with self._session_lock:
+            self._generation += 1
             self._current_session_segments = []
-            logger.debug("ASR 会话已开始")
+            logger.debug("ASR 会话已开始 (generation=%d)", self._generation)
 
     def push_segment(self, segment: List[bytes]) -> None:
         """
@@ -206,11 +223,40 @@ class ASRWorker:
             except queue.Full:
                 logger.error("ASR 队列已满，无法处理最终音频")
 
+    def process_audio(self, audio_data: bytes) -> None:
+        """
+        直接处理完整音频 - 简化接口
+
+        用于非流式场景，一次性提交完整音频进行异步识别
+
+        P0 幂等机制：附带当前 generation，防止旧任务覆盖新任务
+
+        Args:
+            audio_data: 完整的音频数据（bytes）
+        """
+        if not audio_data:
+            logger.warning("音频数据为空，跳过处理")
+            return
+
+        try:
+            # 获取当前 generation
+            with self._session_lock:
+                generation = self._generation
+
+            # 非阻塞放入队列（附带 generation）
+            self._segment_queue.put_nowait((audio_data, generation))
+            logger.debug("音频已提交到 ASR 队列，大小: %d bytes, generation=%d",
+                        len(audio_data), generation)
+        except queue.Full:
+            logger.error("ASR 队列已满，无法处理音频")
+
     def _worker_loop(self):
         """
         ASR 工作循环 - 在独立线程中运行
 
         持续从队列获取音频段并识别
+
+        P0 幂等机制：检查 generation，丢弃过期任务
         """
         logger.info("ASR Worker 线程已启动")
 
@@ -218,9 +264,26 @@ class ASRWorker:
             try:
                 # 阻塞获取音频段（超时 0.1 秒，避免永久阻塞）
                 try:
-                    audio_data = self._segment_queue.get(timeout=0.1)
+                    item = self._segment_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
+
+                # 解包 audio_data 和 generation
+                if isinstance(item, tuple) and len(item) == 2:
+                    audio_data, generation = item
+                else:
+                    # 兼容旧格式（只有 audio_data）
+                    audio_data = item
+                    generation = 0
+
+                # P0: 检查 generation 是否过期
+                with self._session_lock:
+                    current_generation = self._generation
+
+                if generation != current_generation:
+                    logger.debug("任务已过期 (generation=%d, current=%d)，丢弃",
+                               generation, current_generation)
+                    continue  # 跳过过期任务
 
                 # 识别音频
                 self._process_audio(audio_data)
@@ -228,7 +291,7 @@ class ASRWorker:
                 self._total_processed += 1
 
             except Exception as e:
-                logger.error(f"ASR Worker 处理失败: {e}")
+                logger.error("ASR Worker 处理失败: %s", e)
                 if self._on_error:
                     self._on_error(e)
 
@@ -255,13 +318,22 @@ class ASRWorker:
             result = self._asr_engine.recognize_bytes(audio_data)
 
             if result:
-                logger.info(f"ASR 识别: '{result}'")
+                logger.info("ASR 识别: '%s'", result)
+                logger.info("_on_result 回调: %s", self._on_result)
 
                 # 回调
                 if self._on_result:
-                    self._on_result(result)
+                    logger.info("调用 _on_result 回调...")
+                    try:
+                        self._on_result(result)
+                        logger.info("_on_result 回调完成")
+                    except Exception as cb_error:
+                        logger.error("_on_result 回调异常: %s", cb_error)
+                        raise
+                else:
+                    logger.error("_on_result 回调未注册！")
             else:
-                logger.debug("ASR 识别结果为空")
+                logger.info("ASR 识别结果为空")
 
         except Exception as e:
             logger.error(f"ASR 识别失败: {e}")
