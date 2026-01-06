@@ -24,34 +24,57 @@ class HotkeyAction(Enum):
 
 
 class HotkeyState(Enum):
-    """快捷键状态机 - P0 重构"""
-    IDLE = "idle"                    # 空闲，无快捷键激活
-    VOICE_RECORDING = "voice_recording"  # 语音输入录音中
-    TRANSLATE_RECORDING = "translate_recording"  # 翻译录音中
+    """快捷键状态机 - 支持两种触发模式"""
+    # 通用状态
+    IDLE = "idle"                                          # 空闲
+
+    # 一次按键模式（语音输入 - Option键）
+    VOICE_RECORDING = "voice_recording"                    # 语音输入录音中（一次按键）
+    VOICE_TAIL_COLLECTING = "voice_tail_collecting"        # 语音输入尾音收集中
+
+    # 双击+长按+延迟尾音模式（翻译 - Command键）
+    WAIT_FIRST_RELEASE = "wait_first_release"              # 等待第一次快速释放
+    WAIT_SECOND_KEY = "wait_second_key"                    # 等待第二次按键
+    WAIT_LONG_PRESS = "wait_long_press"                    # 等待长按确认
+    TRANSLATE_RECORDING = "translate_recording"            # 翻译录音中
+    TRANSLATE_TAIL_COLLECTING = "translate_tail_collecting" # 翻译尾音收集中
 
 
 class HotkeyManager:
     """
-    全局快捷键管理器 (P0 重构版)
+    全局快捷键管理器 (支持两种触发模式)
 
     功能:
     - 跨平台全局快捷键监听
+    - 两种触发模式：
+      * 一次按键模式：按下开始录音，松开停止（用于语音输入）
+      * 双击+长按+延迟尾音：防误触的精确触发（用于翻译）
     - 状态机管理 (IDLE → RECORDING → IDLE)
     - 防抖机制 (50ms)
     - 幂等性保证 (重复keydown忽略)
     - Watchdog 超时保护 (10秒强制回IDLE)
     - Listener 功能测试（检测静默失效）
 
-    P0 改进:
-    - 显式状态机替代布尔标志
-    - 防抖防止误触发
-    - Watchdog 防止卡死
-    - 所有状态转换可恢复
-    - 按键事件时间跟踪（检测静默失效）
+    触发模式:
+    - 语音输入（Option键）: 一次按键，按下开始录音，松开停止
+    - 快速翻译（Command键）: 双击+长按+延迟尾音，防止误触
     """
 
     # 防抖时间 (毫秒)
     DEBOUNCE_MS = 50
+
+    # ========== 双击+长按+延迟尾音参数 ==========
+    # 第一次按键：快速释放阈值（毫秒）
+    FIRST_RELEASE_TIMEOUT = 150  # 第一次按键必须在 150ms 内释放
+
+    # 两次按键间隔阈值（毫秒）
+    DOUBLE_CLICK_INTERVAL = 500  # 两次按键间隔不能超过 500ms
+
+    # 长按确认阈值（毫秒）
+    LONG_PRESS_THRESHOLD = 350   # 第二次按键必须按住 > 350ms
+
+    # 尾音收集延迟（毫秒）
+    TAIL_SOUND_DELAY = 200        # 松开后延迟 200ms 收集尾音
 
     # Watchdog 超时 (秒) - 防止卡死
     WATCHDOG_TIMEOUT_S = 10
@@ -86,7 +109,13 @@ class HotkeyManager:
         # 按键事件时间跟踪 - 检测 listener 静默失效
         self._last_key_event_time: float = time.time()  # 上次收到任何按键事件的时间
 
-        logger.info("快捷键管理器初始化完成 (P0 重构版: 状态机 + 防抖 + watchdog + 按键事件跟踪)")
+        # ========== 双击+长按+延迟尾音状态跟踪（仅用于翻译模式） ==========
+        self._first_keydown_time: Optional[float] = None   # 第一次按键按下时间
+        self._first_keyup_time: Optional[float] = None     # 第一次按键释放时间
+        self._second_keydown_time: Optional[float] = None  # 第二次按键按下时间
+        self._tail_timer: Optional[threading.Timer] = None  # 尾音延迟定时器
+
+        logger.info("快捷键管理器初始化完成 (支持两种触发模式：一次按键 + 双击+长按)")
 
     def register_callback(self, action: HotkeyAction, callback: Callable) -> None:
         """
@@ -139,26 +168,29 @@ class HotkeyManager:
                 return "alt_l"
             return "ctrl_r"
 
-        # 修饰键
-        if part in ["ctrl", "control"]:
+        # ========== 左侧修饰键 ==========
+        if part in ["left_ctrl", "ctrl", "control"]:
             return "ctrl_l"
-        if part in ["alt", "option"]:
+        if part in ["left_alt", "alt", "option"]:
             return "alt_l"
-        if part == "shift":
+        if part in ["left_shift", "shift"]:
             return "shift_l"
-        if part in ["cmd", "command", "win", "windows"]:
+        if part in ["left_cmd", "left_command", "cmd", "command", "win", "windows"]:
+            # pynput 在 macOS 上只能识别通用的 cmd 键，无法区分左右
+            # 所以即使指定 left_cmd，也映射到 "cmd"
             return "cmd"
 
-        # 右侧修饰键
-        if part == "right_ctrl":
+        # ========== 右侧修饰键 ==========
+        if part in ["right_ctrl"]:
             return "ctrl_r"
-        if part == "right_alt":
+        if part in ["right_alt", "right_option"]:
             return "alt_r"
-        if part == "right_shift":
+        if part in ["right_shift"]:
             return "shift_r"
-        # macOS 上 pynput 无法区分左右 Command 键，统一使用 cmd
         if part in ["right_cmd", "right_command"]:
-            return "cmd" if IS_MACOS else "cmd_r"
+            # pynput 在 macOS 上只能识别通用的 cmd 键，无法区分左右
+            # 所以即使指定 right_cmd，也映射到 "cmd"
+            return "cmd"
 
         # 字母和数字 - 直接返回字符
         if len(part) == 1:
@@ -217,11 +249,17 @@ class HotkeyManager:
         logger.info(f"快捷键已设置: {name} = {hotkey_str}")
         return True
 
-    def _match_hotkey(self, name: str, pressed_keys: Set[keyboard.Key]) -> bool:
-        """检查当前按键是否匹配快捷键"""
+    def _match_hotkey(self, name: str, pressed_keys: Set[str]) -> bool:
+        """
+        检查当前按键是否匹配快捷键
+
+        完全根据配置判断，不做任何特殊处理
+        """
         if name not in self._hotkeys:
             return False
-        return self._hotkeys[name] == pressed_keys
+
+        configured_keys = self._hotkeys[name]
+        return configured_keys == pressed_keys
 
     def start(self, voice_input_hotkey: str, translate_hotkey: str) -> bool:
         """
@@ -229,7 +267,7 @@ class HotkeyManager:
 
         Args:
             voice_input_hotkey: 语音输入快捷键
-            translate_hotkey: 翻译快捷键
+            translate_hotkey: 翻译快捷键（可为空字符串）
 
         Returns:
             是否启动成功
@@ -237,7 +275,8 @@ class HotkeyManager:
         # 设置快捷键
         if not self.set_hotkey("voice_input", voice_input_hotkey):
             return False
-        if not self.set_hotkey("quick_translate", translate_hotkey):
+        # 翻译快捷键可以为空（不使用翻译功能）
+        if translate_hotkey and not self.set_hotkey("quick_translate", translate_hotkey):
             return False
 
         # 启动监听器
@@ -535,7 +574,7 @@ class HotkeyManager:
 
     def _reset_state(self) -> None:
         """
-        重置状态到 IDLE (幂等操作) - P0 重构
+        重置状态到 IDLE (幂等操作)
 
         用于异常恢复、watchdog 触发等场景
         """
@@ -544,12 +583,22 @@ class HotkeyManager:
         self._last_activity_time = time.time()
         self._last_keydown_time.clear()
 
+        # 清理双击+长按状态变量（仅翻译模式使用）
+        self._first_keydown_time = None
+        self._first_keyup_time = None
+        self._second_keydown_time = None
+
+        # 取消尾音收集定时器
+        if self._tail_timer:
+            self._tail_timer.cancel()
+            self._tail_timer = None
+
         if old_state != HotkeyState.IDLE:
             logger.warning(f"状态已重置: {old_state.value} → IDLE")
 
     def _transition_state(self, new_state: HotkeyState) -> bool:
         """
-        状态转换 (带验证) - P0 重构
+        状态转换 (带验证) - 支持两种触发模式
 
         Args:
             new_state: 目标状态
@@ -558,11 +607,43 @@ class HotkeyManager:
             是否转换成功
         """
         with self._state_lock:
-            # 验证状态转换合法性
+            # 验证状态转换合法性（支持两种模式）
             valid_transitions = {
-                HotkeyState.IDLE: [HotkeyState.VOICE_RECORDING, HotkeyState.TRANSLATE_RECORDING],
-                HotkeyState.VOICE_RECORDING: [HotkeyState.IDLE],
-                HotkeyState.TRANSLATE_RECORDING: [HotkeyState.IDLE],
+                # IDLE 状态可以转换到：
+                HotkeyState.IDLE: [
+                    HotkeyState.VOICE_RECORDING,          # 一次按键模式：按下 Option 开始录音
+                    HotkeyState.WAIT_FIRST_RELEASE,       # 双击模式：第一次按键按下
+                ],
+                # 双击模式的状态转换
+                HotkeyState.WAIT_FIRST_RELEASE: [
+                    HotkeyState.WAIT_SECOND_KEY,          # 第一次快速释放
+                    HotkeyState.IDLE,                     # 释放太慢，回到 IDLE
+                ],
+                HotkeyState.WAIT_SECOND_KEY: [
+                    HotkeyState.WAIT_LONG_PRESS,          # 第二次按键按下
+                    HotkeyState.IDLE,                     # 超时，回到 IDLE
+                ],
+                HotkeyState.WAIT_LONG_PRESS: [
+                    HotkeyState.TRANSLATE_RECORDING,      # 长按确认，开始录音
+                    HotkeyState.IDLE,                     # 释放太早，回到 IDLE
+                ],
+                # 翻译录音状态
+                HotkeyState.TRANSLATE_RECORDING: [
+                    HotkeyState.TRANSLATE_TAIL_COLLECTING, # 按键释放，收集尾音
+                    HotkeyState.IDLE,                     # 直接停止（兼容模式）
+                ],
+                HotkeyState.TRANSLATE_TAIL_COLLECTING: [
+                    HotkeyState.IDLE,                     # 尾音收集完成
+                ],
+                # 语音输入录音状态（一次按键模式 + 尾音收集）
+                HotkeyState.VOICE_RECORDING: [
+                    HotkeyState.VOICE_TAIL_COLLECTING,    # 按键释放，收集尾音
+                    HotkeyState.IDLE,                     # 直接停止（兼容模式）
+                ],
+                # 尾音收集状态
+                HotkeyState.VOICE_TAIL_COLLECTING: [
+                    HotkeyState.IDLE,                     # 尾音收集完成
+                ],
             }
 
             if new_state not in valid_transitions.get(self._state, []):
@@ -575,7 +656,7 @@ class HotkeyManager:
             self._state = new_state
             self._last_activity_time = time.time()
 
-            logger.debug(f"状态转换: {old_state.value} → {new_state.value}")
+            logger.info(f"状态转换: {old_state.value} → {new_state.value}")
             return True
 
     def get_state(self) -> HotkeyState:
@@ -584,13 +665,18 @@ class HotkeyManager:
 
     def _on_press(self, key) -> None:
         """
-        按键按下事件 (P0 重构版)
+        按键按下事件 - 支持两种触发模式
 
-        改进:
-        - 防抖 (50ms)
-        - 幂等性 (重复keydown忽略)
-        - 状态机管理
-        - 按键事件时间跟踪
+        一次按键模式（Option - 语音输入）:
+        1. IDLE → 按下 Option → VOICE_RECORDING（开始录音）
+        2. VOICE_RECORDING → 释放 Option → VOICE_TAIL_COLLECTING（收集尾音）
+        3. VOICE_TAIL_COLLECTING → 延迟 200ms → IDLE（停止录音并提交 ASR）
+
+        双击+长按模式（Command - 翻译）:
+        1. IDLE → 第一次轻按 Command（<150ms 释放）→ WAIT_SECOND_KEY
+        2. WAIT_SECOND_KEY → 第二次按下 Command（按住 >350ms）→ TRANSLATE_RECORDING
+        3. TRANSLATE_RECORDING → 释放 Command → TRANSLATE_TAIL_COLLECTING（收集尾音）
+        4. TRANSLATE_TAIL_COLLECTING → 延迟 200ms → IDLE（停止录音并翻译）
         """
         try:
             # 更新按键事件时间（用于检测 listener 静默失效）
@@ -602,55 +688,113 @@ class HotkeyManager:
             # 添加到已按下集合
             self._pressed_keys.add(key_str)
 
-            # P0: 防抖检查
+            # 防抖检查（防止重复触发）
             current_time = time.time()
             last_time = self._last_keydown_time.get(key_str, 0)
             if current_time - last_time < (self.DEBOUNCE_MS / 1000):
                 logger.debug(f"防抖: 忽略重复按下 ({key_str})")
                 return
 
-            # P0: 幂等性 + 状态机检查
+            self._last_keydown_time[key_str] = current_time
+
+            # ========== 状态机处理 ==========
             with self._state_lock:
-                # 如果已经在录音中，忽略重复的 keydown
-                if self._state != HotkeyState.IDLE:
-                    logger.debug(f"状态非 IDLE ({self._state.value})，忽略 keydown")
+                # 根据配置动态判断是否匹配快捷键
+                is_voice_hotkey = self._match_hotkey("voice_input", self._pressed_keys)
+                is_translate_hotkey = self._match_hotkey("quick_translate", self._pressed_keys)
+
+                # ========== 一次按键模式（语音输入 - 左右 Option键） ==========
+                if is_voice_hotkey and self._state == HotkeyState.IDLE:
+                    logger.info(f"[一次按键模式] 语音输入开始 ({key_str})")
+                    # 状态转换: IDLE → VOICE_RECORDING
+                    self._transition_state(HotkeyState.VOICE_RECORDING)
+                    self._trigger_callback(HotkeyAction.VOICE_INPUT_PRESS)
                     return
 
-                # 检查语音输入快捷键
-                voice_keys = self._hotkeys.get("voice_input", set())
-                if voice_keys and voice_keys == self._pressed_keys:
-                    # 幂等性: 再次检查状态（双重检查锁定）
-                    if self._state == HotkeyState.IDLE:
-                        # 状态转换: IDLE → VOICE_RECORDING
-                        if self._transition_state(HotkeyState.VOICE_RECORDING):
-                            self._last_keydown_time[key_str] = current_time
-                            logger.info(f"语音输入: 开始录音 (状态: {self._state.value})")
-                            self._trigger_callback(HotkeyAction.VOICE_INPUT_PRESS)
+                # ========== 双击模式（翻译 - 如有配置） ==========
+                if is_translate_hotkey and self._state == HotkeyState.IDLE:
+                    # ========== 第一次按键按下 ==========
+                    logger.info(f"[双击模式] 第一次按键按下 ({key_str})")
+                    self._first_keydown_time = current_time
+                    self._first_keyup_time = None
+                    self._second_keydown_time = None
 
-                # 检查翻译快捷键
-                translate_keys = self._hotkeys.get("quick_translate", set())
-                logger.debug(f"翻译快捷键检查: 已按下={self._pressed_keys}, 目标={translate_keys}")
-                if translate_keys and translate_keys == self._pressed_keys:
-                    # 幂等性: 再次检查状态
-                    if self._state == HotkeyState.IDLE:
-                        # 状态转换: IDLE → TRANSLATE_RECORDING
-                        if self._transition_state(HotkeyState.TRANSLATE_RECORDING):
-                            self._last_keydown_time[key_str] = current_time
-                            logger.info(f"快速翻译: 开始录音 (状态: {self._state.value})")
-                            self._trigger_callback(HotkeyAction.QUICK_TRANSLATE_PRESS)
+                    # 状态转换: IDLE → WAIT_FIRST_RELEASE
+                    self._transition_state(HotkeyState.WAIT_FIRST_RELEASE)
+
+                    # 启动超时定时器（如果 150ms 内没释放，取消）
+                    def first_press_timeout():
+                        with self._state_lock:
+                            if self._state == HotkeyState.WAIT_FIRST_RELEASE:
+                                logger.info("第一次按键超时（未快速释放），回到 IDLE")
+                                self._reset_state()
+
+                    timer = threading.Timer(
+                        self.FIRST_RELEASE_TIMEOUT / 1000.0,
+                        first_press_timeout
+                    )
+                    timer.daemon = True
+                    timer.start()
+                    return
+
+                if is_translate_hotkey and self._state == HotkeyState.WAIT_SECOND_KEY:
+                    # ========== 第二次按键按下 ==========
+                    logger.info(f"[双击模式] 第二次按键按下 ({key_str})")
+
+                    # 检查两次按键间隔
+                    if self._first_keyup_time is None:
+                        logger.warning("第一次按键未释放，忽略第二次按键")
+                        return
+
+                    interval = (current_time - self._first_keyup_time) * 1000  # 转换为毫秒
+                    if interval > self.DOUBLE_CLICK_INTERVAL:
+                        logger.info(f"两次按键间隔太长 ({interval:.0f}ms > {self.DOUBLE_CLICK_INTERVAL}ms)，回到 IDLE")
+                        self._reset_state()
+                        return
+
+                    self._second_keydown_time = current_time
+
+                    # 状态转换: WAIT_SECOND_KEY → WAIT_LONG_PRESS
+                    self._transition_state(HotkeyState.WAIT_LONG_PRESS)
+
+                    # 启动长按检测定时器
+                    def check_long_press():
+                        with self._state_lock:
+                            if self._state == HotkeyState.WAIT_LONG_PRESS:
+                                # 长按确认，开始录音
+                                logger.info(f"[双击模式] 长按确认 ({self.LONG_PRESS_THRESHOLD}ms)，开始翻译录音")
+                                self._transition_state(HotkeyState.TRANSLATE_RECORDING)
+                                self._trigger_callback(HotkeyAction.QUICK_TRANSLATE_PRESS)
+
+                    timer = threading.Timer(
+                        self.LONG_PRESS_THRESHOLD / 1000.0,
+                        check_long_press
+                    )
+                    timer.daemon = True
+                    timer.start()
+                    return
+
+                if self._state == HotkeyState.WAIT_LONG_PRESS:
+                    # ========== 在等待长按期间又按了键 ==========
+                    logger.info("长按等待期间重复按键，忽略")
+                    # 保持当前状态，等待长按定时器触发
 
         except Exception as e:
             logger.error(f"处理按键按下事件失败: {e}")
 
     def _on_release(self, key) -> None:
         """
-        按键释放事件 (P0 重构版)
+        按键释放事件 - 支持两种触发模式
 
-        改进:
-        - 状态机管理
-        - 只在对应状态下触发回调
-        - 状态自动回 IDLE
-        - 按键事件时间跟踪
+        一次按键模式（Option - 语音输入）:
+        - VOICE_RECORDING → 释放 Option → VOICE_TAIL_COLLECTING（收集 200ms 尾音）
+        - VOICE_TAIL_COLLECTING → IDLE（停止录音）
+
+        双击模式（Command - 翻译）:
+        - WAIT_FIRST_RELEASE → 检测是否快速释放 (<150ms)
+        - WAIT_LONG_PRESS → 释放太早，取消
+        - TRANSLATE_RECORDING → 释放 Command → TRANSLATE_TAIL_COLLECTING（收集 200ms 尾音）
+        - TRANSLATE_TAIL_COLLECTING → IDLE（停止录音）
         """
         try:
             # 更新按键事件时间（用于检测 listener 静默失效）
@@ -662,35 +806,114 @@ class HotkeyManager:
             # 从已按下集合移除
             self._pressed_keys.discard(key_str)
 
-            # P0: 使用状态机判断
-            with self._state_lock:
-                # 检查语音输入快捷键释放
-                voice_keys = self._hotkeys.get("voice_input", set())
-                if voice_keys and key_str in voice_keys:
-                    if self._state == HotkeyState.VOICE_RECORDING:
-                        # 状态转换: VOICE_RECORDING → IDLE
-                        if self._transition_state(HotkeyState.IDLE):
-                            logger.info(f"语音输入: 停止录音 (状态: {self._state.value})")
-                            self._trigger_callback(HotkeyAction.VOICE_INPUT_RELEASE)
-                    else:
-                        logger.debug(
-                            f"语音输入 keyup 但状态不匹配 "
-                            f"(key={key_str}, state={self._state.value})"
-                        )
+            current_time = time.time()
 
-                # 检查翻译快捷键释放
+            # ========== 状态机处理 ==========
+            with self._state_lock:
+                # 根据配置动态判断是否匹配快捷键
+                voice_keys = self._hotkeys.get("voice_input", set())
                 translate_keys = self._hotkeys.get("quick_translate", set())
-                if translate_keys and key_str in translate_keys:
-                    if self._state == HotkeyState.TRANSLATE_RECORDING:
-                        # 状态转换: TRANSLATE_RECORDING → IDLE
-                        if self._transition_state(HotkeyState.IDLE):
-                            logger.info(f"快速翻译: 停止录音 (状态: {self._state.value})")
-                            self._trigger_callback(HotkeyAction.QUICK_TRANSLATE_RELEASE)
-                    else:
-                        logger.debug(
-                            f"翻译 keyup 但状态不匹配 "
-                            f"(key={key_str}, state={self._state.value})"
+
+                is_voice_key = voice_keys and key_str in voice_keys
+                is_translate_key = translate_keys and key_str in translate_keys
+
+                # ========== 双击模式：第一次按键释放 ==========
+                if is_translate_key and self._state == HotkeyState.WAIT_FIRST_RELEASE:
+                    release_time = (current_time - self._first_keydown_time) * 1000  # 毫秒
+
+                    if release_time <= self.FIRST_RELEASE_TIMEOUT:
+                        # 快速释放，进入等待第二次按键状态
+                        logger.info(f"[双击模式] 第一次快速释放 ({release_time:.0f}ms < {self.FIRST_RELEASE_TIMEOUT}ms)")
+                        self._first_keyup_time = current_time
+
+                        # 状态转换: WAIT_FIRST_RELEASE → WAIT_SECOND_KEY
+                        self._transition_state(HotkeyState.WAIT_SECOND_KEY)
+
+                        # 启动超时定时器（如果 500ms 内没第二次按键，取消）
+                        def double_click_timeout():
+                            with self._state_lock:
+                                if self._state == HotkeyState.WAIT_SECOND_KEY:
+                                    logger.info("双击超时（无第二次按键），回到 IDLE")
+                                    self._reset_state()
+
+                        timer = threading.Timer(
+                            self.DOUBLE_CLICK_INTERVAL / 1000.0,
+                            double_click_timeout
                         )
+                        timer.daemon = True
+                        timer.start()
+                    else:
+                        # 释放太慢，取消
+                        logger.info(f"[双击模式] 第一次释放太慢 ({release_time:.0f}ms)，回到 IDLE")
+                        self._reset_state()
+                    return
+
+                # ========== 双击模式：长按等待期间释放 ==========
+                if is_translate_key and self._state == HotkeyState.WAIT_LONG_PRESS:
+                    # 用户在长按确认前就释放了，取消
+                    logger.info("[双击模式] 长按等待期间释放，回到 IDLE")
+                    self._reset_state()
+                    return
+
+                # ========== 一次按键模式：语音输入录音结束 + 尾音收集 ==========
+                if is_voice_key and self._state == HotkeyState.VOICE_RECORDING:
+                    logger.info("[一次按键模式] 语音输入结束，开始收集尾音...")
+
+                    # 状态转换: VOICE_RECORDING → VOICE_TAIL_COLLECTING
+                    self._transition_state(HotkeyState.VOICE_TAIL_COLLECTING)
+
+                    # 启动尾音收集定时器（延迟 200ms 后真正停止）
+                    def finish_voice_tail_collecting():
+                        with self._state_lock:
+                            if self._state == HotkeyState.VOICE_TAIL_COLLECTING:
+                                logger.info(f"[一次按键模式] 尾音收集完成 ({self.TAIL_SOUND_DELAY}ms)")
+                                # 状态转换: VOICE_TAIL_COLLECTING → IDLE
+                                self._transition_state(HotkeyState.IDLE)
+                                # 触发停止录音回调
+                                self._trigger_callback(HotkeyAction.VOICE_INPUT_RELEASE)
+
+                    # 取消之前的尾音定时器（如果有）
+                    if self._tail_timer:
+                        self._tail_timer.cancel()
+
+                    # 启动新的尾音定时器
+                    self._tail_timer = threading.Timer(
+                        self.TAIL_SOUND_DELAY / 1000.0,
+                        finish_voice_tail_collecting
+                    )
+                    self._tail_timer.daemon = True
+                    self._tail_timer.start()
+                    return
+
+                # ========== 双击模式：翻译录音结束 + 尾音收集 ==========
+                if is_translate_key and self._state == HotkeyState.TRANSLATE_RECORDING:
+                    logger.info("[双击模式] 翻译录音结束，开始收集尾音...")
+
+                    # 状态转换: TRANSLATE_RECORDING → TRANSLATE_TAIL_COLLECTING
+                    self._transition_state(HotkeyState.TRANSLATE_TAIL_COLLECTING)
+
+                    # 启动尾音收集定时器（延迟 200ms 后真正停止）
+                    def finish_translate_tail_collecting():
+                        with self._state_lock:
+                            if self._state == HotkeyState.TRANSLATE_TAIL_COLLECTING:
+                                logger.info(f"[双击模式] 翻译尾音收集完成 ({self.TAIL_SOUND_DELAY}ms)")
+                                # 状态转换: TRANSLATE_TAIL_COLLECTING → IDLE
+                                self._transition_state(HotkeyState.IDLE)
+                                # 触发停止录音回调
+                                self._trigger_callback(HotkeyAction.QUICK_TRANSLATE_RELEASE)
+
+                    # 取消之前的尾音定时器（如果有）
+                    if self._tail_timer:
+                        self._tail_timer.cancel()
+
+                    # 启动新的尾音定时器
+                    self._tail_timer = threading.Timer(
+                        self.TAIL_SOUND_DELAY / 1000.0,
+                        finish_translate_tail_collecting
+                    )
+                    self._tail_timer.daemon = True
+                    self._tail_timer.start()
+                    return
 
         except Exception as e:
             logger.error(f"处理按键释放事件失败: {e}")
@@ -712,18 +935,22 @@ class HotkeyManager:
             # macOS 上 pynput 可能报告: alt, cmd 等 (不带左右后缀)
             # 我们需要将其映射为与 _parse_key_part 一致的格式
             key_map = {
-                'alt': 'alt_l',      # macOS Option/Alt 键
-                'alt_r': 'alt_l',
-                'alt_l': 'alt_l',
+                # Option/Alt 键 - 保留左右信息
+                'alt': 'alt_l',      # macOS 左 Option/Alt 键（pynput 报告为 alt）
+                'alt_l': 'alt_l',    # 左 Option/Alt
+                'alt_r': 'alt_r',    # 右 Option/Alt（保留右侧信息）
+                # Command 键 - 统一映射（但我们不会监听它）
                 'cmd': 'cmd',        # macOS Command 键 (通用)
                 'cmd_r': 'cmd',      # 右侧 Command 键映射到 cmd
                 'cmd_l': 'cmd',      # 左侧 Command 键映射到 cmd
-                'ctrl': 'ctrl_l',    # Ctrl 键
+                # Control 键
+                'ctrl': 'ctrl_l',    # 左 Ctrl
                 'ctrl_r': 'ctrl_r',  # 右侧 Ctrl
                 'ctrl_l': 'ctrl_l',  # 左侧 Ctrl
-                'shift': 'shift_l',  # Shift 键
-                'shift_r': 'shift_r',
-                'shift_l': 'shift_l',
+                # Shift 键
+                'shift': 'shift_l',  # 左 Shift
+                'shift_r': 'shift_r', # 右侧 Shift
+                'shift_l': 'shift_l', # 左侧 Shift
             }
             return key_map.get(key_str, key_str)
         return str(key)

@@ -34,10 +34,12 @@ IS_LINUX = PLATFORM == "Linux"
 
 # ==================== 默认配置 ====================
 # 快捷键默认值
-# Option 键在终端中也能正常工作
+# pynput 支持左右 Option 键辨别
+# 左 Option 用于语音输入（一次按键）
+# 右 Option 用于翻译（双击+长按）
 DEFAULT_HOTKEYS = {
-    "voice_input": "option",  # Option (Alt) 键用于语音输入
-    "quick_translate": "right_cmd" if IS_MACOS else "ctrl+shift+t",  # 右 Command 用于翻译（macOS）
+    "voice_input": "left_alt" if IS_MACOS else "right_ctrl",  # 左 Option 用于语音输入（macOS）
+    "quick_translate": "right_alt" if IS_MACOS else "ctrl+shift+t",  # 右 Option 用于翻译（macOS）
 }
 
 # 音频默认配置
