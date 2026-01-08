@@ -1,0 +1,33 @@
+{
+  "version": "1.0.1",
+  "hotkeys": {
+    "voice_input": "left_alt",
+    "quick_translate": "right_alt"
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "chunk_duration": 30,
+    "vad_threshold": 500,
+    "vad_padding": 300
+  },
+  "translation": {
+    "mode": "button",
+    "target_language": "en",
+    "source_language": "zh"
+  },
+  "cleanup": {
+    "enabled": true,
+    "days": 7
+  },
+  "models": {
+    "asr": null,
+    "translation": null
+  },
+  "text_processing": {
+    "use_ai": false
+  },
+  "injection": {
+    "method": "clipboard"
+  }
+}
