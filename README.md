@@ -2,6 +2,7 @@
 
 > 本地优先的 AI 语音输入法 - 毫秒响应，隐私安全
 
+[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/dspcter/fastvoice)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -16,6 +17,7 @@
 | 🔢 **数字转换** | 智能识别并转换中文数字（幺三八→138、零一二三→0123） |
 | ⚡ **极速响应** | 端侧模型，毫秒级识别速度 |
 | 🔒 **隐私安全** | 音频本地处理，不上传云端 |
+| 🍎 **原生体验** | macOS 原生键盘操作，可靠稳定 |
 | ⚙️ **灵活配置** | 自定义快捷键、麦克风、翻译模式 |
 | 📁 **音频管理** | 自动清理和管理录音文件 |
 
@@ -29,6 +31,7 @@
 | **Python** | 3.10+ |
 | **内存** | 8GB+ (推荐 16GB) |
 | **磁盘空间** | 5GB+ (模型文件) |
+| **macOS 特定** | 需要 PyObjC（已包含在依赖中） |
 
 ---
 
@@ -94,9 +97,9 @@ python main.py
 | **语音识别** | sherpa-onnx + SenseVoice-small |
 | **翻译引擎** | MarianMT (离线) / Qwen2.5-1.5B |
 | **数字转换** | cn2an (自定义增强) |
-| **快捷键监听** | pynput |
+| **快捷键监听** | PyObjC (macOS 原生) |
 | **音频采集** | sounddevice + webrtcvad |
-| **文字注入** | pyautogui (剪贴板方式) |
+| **文字注入** | PyObjC Quartz CGEvent (macOS 原生) |
 | **设置界面** | PyQt6 |
 | **打包工具** | PyInstaller |
 
@@ -115,12 +118,14 @@ python main.py
 │
 ├── core/                       # 核心功能模块
 │   ├── __init__.py
-│   ├── hotkey_manager.py       # 全局快捷键监听
+│   ├── hotkey_manager.py       # 全局快捷键管理
+│   ├── pyobjc_keyboard_listener.py  # PyObjC 原生键盘监听 (macOS)
 │   ├── audio_capture.py        # 音频采集 + VAD
 │   ├── asr_engine.py           # SenseVoice 语音识别
 │   ├── marianmt_engine.py      # MarianMT 翻译
 │   ├── translate_engine.py     # Qwen2.5 翻译
-│   ├── text_injector.py        # 文字注入
+│   ├── text_injector.py        # 文字注入器
+│   ├── text_injector_macos.py  # macOS 原生按键模拟
 │   └── text_postprocessor.py    # 文本后处理 + 数字转换
 │
 ├── models/                     # 模型管理
@@ -223,6 +228,36 @@ python3 -c "import cn2an; print(cn2an.transform('幺三八零一二三'))"
 
 ## 📝 更新日志
 
+### v1.4.0 (2026-01-08)
+
+**🎉 重大更新 - 完全迁移到 PyObjC 原生键盘操作**
+
+**核心重构**
+- ✨ 完全使用 PyObjC 进行键盘监听和模拟（macOS 原生）
+- ✨ 使用 Quartz CGEvent API 实现可靠的按键模拟
+- ✨ 修复组合键识别问题（Command+V 等快捷键）
+- ✨ 修复 V 键 keycode 错误（0x6E → 0x09）
+
+**依赖优化**
+- 🗑️ 移除 pynput 依赖
+- 🗑️ 移除 pyautogui 依赖
+- ✅ PyObjC 成为唯一的键盘操作依赖
+
+**新增模块**
+- 📦 `core/text_injector_macos.py` - macOS 原生按键模拟器
+- 📦 `core/pyobjc_keyboard_listener.py` - PyObjC 键盘监听器
+
+**技术改进**
+- 📝 使用正确的组合键序列（修饰键按下 → 主键按下 → 主键释放 → 修饰键释放）
+- 🛡️ 内置注入事件过滤机制，防止监听器拦截自己的事件
+- 📊 增强日志输出，便于调试
+- 🔧 优化按键时序控制（combo_delay: 50ms, post_delay: 100ms）
+
+**测试验证**
+- ✅ PyObjC 文字注入正常工作
+- ✅ Command+V 等组合键可靠识别
+- ✅ 完全移除第三方键盘依赖
+
 ### v1.2.1 (2026-01-06)
 
 **🎉 重大更新 - 快捷键系统全面重构**
@@ -281,7 +316,18 @@ python3 -c "import cn2an; print(cn2an.transform('幺三八零一二三'))"
 
 ### Q: 首次启动提示权限错误？
 
-**A**: macOS 需要在「系统设置 → 隐私与安全性 → 辅助功能」中授权
+**A**: macOS 需要在「系统设置 → 隐私与安全性 → 辅助功能」中授权：
+1. 打开「系统设置」
+2. 进入「隐私与安全性」
+3. 选择「辅助功能」
+4. 找到「快人快语」并勾选
+
+### Q: 文字注入失败怎么办？
+
+**A**: v1.4.0 使用 macOS 原生 PyObjC 框架，通常不需要额外配置。如果遇到问题：
+1. 确认已安装 PyObjC：`pip install PyObjC`
+2. 检查是否有其他应用占用剪贴板
+3. 查看日志文件 `logs/*.log` 获取详细错误信息
 
 ### Q: 模型下载失败？
 
@@ -315,7 +361,7 @@ python3 -c "import cn2an; print(cn2an.transform('幺三八零一二三'))"
 - [Qwen2.5](https://github.com/QwenLM/Qwen2.5) - 通义千问大模型
 - [MarianMT](https://github.com/Helsinki-NLP/MarianMT) - 神经机器翻译
 - [cn2an](https://github.com/Ailln/cn2an) - 中文数字转换工具
-- [pynput](https://github.com/moses-palmer/pynput) - 全局快捷键监听
+- [PyObjC](https://github.com/ronaldoussoren/pyobjc) - Python-Objective-C 桥接
 
 **产品灵感**: 闪电说
 
