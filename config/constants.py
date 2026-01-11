@@ -7,7 +7,7 @@ from pathlib import Path
 # ==================== 项目信息 ====================
 APP_NAME = "快人快语"
 APP_NAME_EN = "FastVoice"
-VERSION = "1.4.0"
+VERSION = "1.4.3"
 
 # ==================== 路径配置 ====================
 # 项目根目录
@@ -40,6 +40,46 @@ IS_LINUX = PLATFORM == "Linux"
 DEFAULT_HOTKEYS = {
     "voice_input": "left_alt" if IS_MACOS else "right_ctrl",  # 左 Option 用于语音输入（macOS）
     "quick_translate": "right_alt" if IS_MACOS else "ctrl+shift+t",  # 右 Option 用于翻译（macOS）
+}
+
+# ==================== 快捷键预设选项 (v1.4.2) ====================
+# 快捷键预设列表（用于设置界面下拉选择）
+HOTKEY_PRESETS = {
+    "macos": [
+        ("left_alt", "左 Option (⌥)"),
+        ("right_alt", "右 Option (⌥)"),
+        ("left_ctrl", "左 Control (⌃)"),
+        ("right_ctrl", "右 Control (⌃)"),
+        ("left_cmd", "左 Command (⌘)"),
+        ("right_cmd", "右 Command (⌘)"),
+        ("fn", "Fn 键"),
+    ],
+    "windows": [
+        ("right_ctrl", "右 Control"),
+        ("ctrl+shift+t", "Ctrl+Shift+T"),
+        ("capslock", "Caps Lock"),
+        ("f6", "F6"),
+        ("f7", "F7"),
+        ("f8", "F8"),
+    ]
+}
+
+# 快捷键触发模式
+HOTKEY_MODES = [
+    ("single_press", "一次长按", "按下开始录音，松开停止"),
+    ("double_press", "两次按键", "双击后长按开始录音"),
+]
+
+# 默认快捷键配置（包含模式）- v1.4.2 新格式
+DEFAULT_HOTKEY_CONFIG = {
+    "voice_input": {
+        "key": "left_alt" if IS_MACOS else "right_ctrl",
+        "mode": "single_press"
+    },
+    "quick_translate": {
+        "key": "right_alt" if IS_MACOS else "ctrl+shift+t",
+        "mode": "double_press"
+    }
 }
 
 # 音频默认配置

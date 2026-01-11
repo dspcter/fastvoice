@@ -26,11 +26,14 @@ from PyQt6.QtWidgets import (
     QDialog,
     QHeaderView,
     QScrollArea,
+    QButtonGroup,
+    QRadioButton,
+    QFrame,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QKeyEvent
 
-from config import get_settings, IS_MACOS, LANGUAGE_NAMES
+from config import get_settings, IS_MACOS, LANGUAGE_NAMES, HOTKEY_PRESETS
 from core import AudioCapture
 from models import get_model_manager, ModelType
 from storage import get_audio_manager
@@ -74,14 +77,33 @@ class SettingsWindow(QWidget):
     - 音频设置
     - 翻译设置
     - 音频管理
+
+    v1.4.2 改进：音频统计异步更新，防止主线程阻塞
     """
 
-    def __init__(self):
+    # 定义信号（跨线程安全更新 UI）
+    _update_stats_signal = pyqtSignal(int, int)  # total_size, file_count
+
+    def __init__(self, apply_callback=None):
+        """
+        初始化设置窗口
+
+        Args:
+            apply_callback: 设置应用回调函数，签名为 (changed_settings: dict) -> bool
+        """
         super().__init__()
         self.settings = get_settings()
         self.model_manager = get_model_manager()
         self.audio_manager = get_audio_manager()
         self.download_thread: Optional[ModelDownloadThread] = None
+        self._apply_callback = apply_callback  # v1.4.2: 设置应用回调
+
+        # v1.4.2: 缓存的统计值（用于快速显示）
+        self._cached_stats = None  # (total_size, file_count)
+        self._stats_update_pending = False  # 是否有待处理的更新请求
+
+        # 连接信号到槽（线程安全）
+        self._update_stats_signal.connect(self._display_stats)
 
         self.init_ui()
         self.load_settings()
@@ -100,11 +122,21 @@ class SettingsWindow(QWidget):
         """
         窗口显示事件 - 重新加载音频统计信息
 
-        每次打开设置窗口时更新音频文件计数和大小
+        v1.4.2 改进：使用缓存值快速显示，后台异步更新
         """
         super().showEvent(event)
         logger.info("设置窗口显示事件触发，更新音频统计")
-        self._update_audio_stats()
+
+        # 立即显示缓存值（如果有）
+        if self._cached_stats:
+            total_size, file_count = self._cached_stats
+            self._display_stats(total_size, file_count)
+
+        # 如果没有待处理的更新请求，启动后台更新
+        if not self._stats_update_pending:
+            self._stats_update_pending = True
+            # 延迟 100ms 后更新，避免阻塞窗口显示动画
+            QTimer.singleShot(100, self._update_audio_stats_async)
 
     def init_ui(self):
         """初始化 UI"""
@@ -170,47 +202,123 @@ class SettingsWindow(QWidget):
         main_layout.addWidget(scroll)
 
     def _create_hotkey_group(self) -> QGroupBox:
-        """创建快捷键设置组"""
+        """
+        创建快捷键设置组 (v1.4.2 改进版)
+
+        改进:
+        - 使用 QComboBox 预设选项
+        - 使用 QButtonGroup + QRadioButton 选择模式
+        - 使用 QLabel buddy 关系提高可访问性
+        """
         group = QGroupBox("快捷键")
         layout = QGridLayout()
+        layout.setVerticalSpacing(15)  # 增加垂直间距
+        layout.setHorizontalSpacing(10)
 
-        # 语音输入快捷键
-        layout.addWidget(QLabel("语音输入快捷键:"), 0, 0)
-        self.voice_hotkey_input = QLineEdit()
-        self.voice_hotkey_input.setPlaceholderText("例如: fn 或 right_ctrl")
-        layout.addWidget(self.voice_hotkey_input, 0, 1)
+        # ===== 语音输入快捷键 =====
+        voice_label = QLabel("&语音输入:")
+        voice_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(voice_label, 0, 0)
 
-        # 快速翻译快捷键
-        layout.addWidget(QLabel("快速翻译快捷键:"), 1, 0)
-        self.translate_hotkey_input = QLineEdit()
-        self.translate_hotkey_input.setPlaceholderText("例如: ctrl+shift+t")
-        layout.addWidget(self.translate_hotkey_input, 1, 1)
+        # 快捷键预设下拉框
+        hotkey_label = QLabel("快捷键:")
+        layout.addWidget(hotkey_label, 1, 0)
 
-        # 常用快捷键示例
-        examples = QLabel("常用格式: fn, ctrl, alt, shift, ctrl+shift+t, cmd+space")
-        examples.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addWidget(examples, 2, 0, 1, 2)
+        self.voice_hotkey_combo = QComboBox()
+        self._populate_hotkey_presets(self.voice_hotkey_combo)
+        hotkey_label.setBuddy(self.voice_hotkey_combo)  # 设置 buddy 关系
+        layout.addWidget(self.voice_hotkey_combo, 1, 1, 1, 2)
 
-        # 恢复快捷键监听按钮
-        recover_hotkey_btn = QPushButton("🔄 恢复快捷键监听")
-        recover_hotkey_btn.setToolTip("如果快捷键没有响应，点击此按钮尝试恢复监听功能")
-        recover_hotkey_btn.clicked.connect(self._on_recover_hotkey)
-        recover_hotkey_btn.setStyleSheet("""
+        # 触发模式选择（使用单选按钮）
+        mode_label = QLabel("触发方式:")
+        layout.addWidget(mode_label, 2, 0)
+
+        self.voice_mode_group = QButtonGroup(self)
+        self.voice_mode_single = QRadioButton("一次长按")
+        self.voice_mode_double = QRadioButton("两次按键")
+
+        # 添加说明子标签
+        single_desc = QLabel("按下开始，松开停止")
+        single_desc.setStyleSheet("color: gray; font-size: 9px; margin-left: 20px;")
+        double_desc = QLabel("双击后长按开始录音")
+        double_desc.setStyleSheet("color: gray; font-size: 9px; margin-left: 20px;")
+
+        self.voice_mode_group.addButton(self.voice_mode_single, 0)
+        self.voice_mode_group.addButton(self.voice_mode_double, 1)
+        self.voice_mode_group.setExclusive(True)
+
+        layout.addWidget(self.voice_mode_single, 2, 1)
+        layout.addWidget(single_desc, 2, 2)
+        layout.addWidget(self.voice_mode_double, 3, 1)
+        layout.addWidget(double_desc, 3, 2)
+
+        # ===== 分隔线 =====
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator, 4, 0, 1, 3)
+
+        # ===== 快速翻译快捷键 =====
+        translate_label = QLabel("&快速翻译:")
+        translate_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(translate_label, 5, 0)
+
+        # 快捷键预设下拉框
+        translate_hotkey_label = QLabel("快捷键:")
+        layout.addWidget(translate_hotkey_label, 6, 0)
+
+        self.translate_hotkey_combo = QComboBox()
+        self._populate_hotkey_presets(self.translate_hotkey_combo)
+        translate_hotkey_label.setBuddy(self.translate_hotkey_combo)
+        layout.addWidget(self.translate_hotkey_combo, 6, 1, 1, 2)
+
+        # 触发模式选择
+        translate_mode_label = QLabel("触发方式:")
+        layout.addWidget(translate_mode_label, 7, 0)
+
+        self.translate_mode_group = QButtonGroup(self)
+        self.translate_mode_single = QRadioButton("一次长按")
+        self.translate_mode_double = QRadioButton("两次按键")
+
+        translate_single_desc = QLabel("按下开始，松开停止")
+        translate_single_desc.setStyleSheet("color: gray; font-size: 9px; margin-left: 20px;")
+        translate_double_desc = QLabel("双击后长按开始录音")
+        translate_double_desc.setStyleSheet("color: gray; font-size: 9px; margin-left: 20px;")
+
+        self.translate_mode_group.addButton(self.translate_mode_single, 0)
+        self.translate_mode_group.addButton(self.translate_mode_double, 1)
+        self.translate_mode_group.setExclusive(True)
+
+        layout.addWidget(self.translate_mode_single, 7, 1)
+        layout.addWidget(translate_single_desc, 7, 2)
+        layout.addWidget(self.translate_mode_double, 8, 1)
+        layout.addWidget(translate_double_desc, 8, 2)
+
+        # ===== 恢复快捷键监听按钮 =====
+        recover_btn = QPushButton("🔄 恢复快捷键监听")
+        recover_btn.setStyleSheet("""
             QPushButton {
                 background-color: #ff9800;
                 color: white;
                 font-weight: bold;
-                padding: 5px;
-                border-radius: 3px;
+                padding: 8px;
+                border-radius: 4px;
             }
             QPushButton:hover {
                 background-color: #fb8c00;
             }
         """)
-        layout.addWidget(recover_hotkey_btn, 3, 0, 1, 2)
+        recover_btn.clicked.connect(self._on_recover_hotkey)
+        layout.addWidget(recover_btn, 9, 0, 1, 3)
 
         group.setLayout(layout)
         return group
+
+    def _populate_hotkey_presets(self, combo: QComboBox):
+        """填充快捷键预设选项"""
+        presets = HOTKEY_PRESETS["macos"] if IS_MACOS else HOTKEY_PRESETS["windows"]
+        for key, label in presets:
+            combo.addItem(label, key)  # label 显示，key 存储
 
     def _create_audio_group(self) -> QGroupBox:
         """创建音频设置组"""
@@ -299,18 +407,28 @@ class SettingsWindow(QWidget):
         return group
 
     def _create_injection_group(self) -> QGroupBox:
-        """创建文字注入设置组"""
+        """
+        创建文字注入设置组 (v1.4.2 改进版)
+
+        改进:
+        - 明确标注 typing 模式仅支持英文
+        - 添加警告提示
+        - 使用 QLabel buddy 关系
+        """
         group = QGroupBox("文字注入")
         layout = QGridLayout()
 
         # 说明文字
         description = QLabel("选择文字注入方式：")
         description.setStyleSheet("color: #333; font-size: 11px;")
-        layout.addWidget(description, 0, 0, 1, 3)
+        layout.addWidget(description, 0, 0, 1, 2)
 
         # 注入方式选择
-        layout.addWidget(QLabel("注入方式:"), 1, 0)
+        method_label = QLabel("&注入方式:")
+        layout.addWidget(method_label, 1, 0)
+
         self.injection_method_combo = QComboBox()
+        method_label.setBuddy(self.injection_method_combo)
 
         from config import IS_WINDOWS
         from core.text_injector import TextInjector
@@ -318,10 +436,11 @@ class SettingsWindow(QWidget):
         injector = TextInjector()
         available_methods = injector.get_available_methods()
 
+        # 改进名称，明确标注 typing 的限制
         method_names = {
-            "clipboard": "剪贴板 (兼容性好)",
-            "typing": "模拟输入 (支持更多输入法)",
-            "win32_native": "Windows 原生 (不污染剪贴板)"
+            "clipboard": "中文输入（剪贴板模式）",
+            "typing": "仅英文输入（typing 模式）⚠️",
+            "win32_native": "Windows 原生（不污染剪贴板）"
         }
 
         for method in available_methods:
@@ -329,16 +448,32 @@ class SettingsWindow(QWidget):
 
         layout.addWidget(self.injection_method_combo, 1, 1)
 
-        # 说明
+        # 警告提示（typing 模式）
+        self.typing_warning = QLabel("⚠️ typing 模式仅支持英文字符，无法输入中文")
+        self.typing_warning.setStyleSheet("color: #ff9800; font-size: 10px;")
+        self.typing_warning.setVisible(False)
+        layout.addWidget(self.typing_warning, 2, 0, 1, 2)
+
+        # 通用说明
         help_text = QLabel(
-            "提示: Windows 原生方式不会污染剪贴板，"
-            "但仅在 Windows 上可用"
+            "提示: Windows 原生方式不会污染剪贴板，但仅在 Windows 上可用"
         )
         help_text.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addWidget(help_text, 2, 0, 1, 3)
+        layout.addWidget(help_text, 3, 0, 1, 2)
+
+        # 连接信号：当选中 typing 时显示警告
+        self.injection_method_combo.currentIndexChanged.connect(
+            self._on_injection_method_changed
+        )
 
         group.setLayout(layout)
         return group
+
+    def _on_injection_method_changed(self, index: int):
+        """注入方式改变时的处理"""
+        method = self.injection_method_combo.itemData(index)
+        # 显示 typing 警告
+        self.typing_warning.setVisible(method == "typing")
 
     def _create_audio_management_group(self) -> QGroupBox:
         """创建音频管理组"""
@@ -449,12 +584,62 @@ class SettingsWindow(QWidget):
             self.microphone_combo.addItem(device["name"], device["index"])
 
     def _update_audio_stats(self):
-        """更新音频统计信息"""
+        """
+        更新音频统计信息（同步版本，已废弃）
+
+        v1.4.2: 此方法会阻塞主线程，建议使用 _update_audio_stats_async
+        保留此方法仅用于向后兼容
+        """
         total_size = self.audio_manager.get_total_size()
         file_count = self.audio_manager.get_file_count()
 
+        # 缓存统计值
+        self._cached_stats = (total_size, file_count)
+
         size_mb = total_size / (1024 * 1024)
         self.audio_stats_label.setText(f"存储: {size_mb:.1f} MB ({file_count} 个文件)")
+
+    def _display_stats(self, total_size: int, file_count: int):
+        """
+        显示统计信息（线程安全）
+
+        v1.4.2 新增：通过信号从后台线程安全更新 UI
+
+        Args:
+            total_size: 总大小（字节）
+            file_count: 文件数量
+        """
+        size_mb = total_size / (1024 * 1024)
+        self.audio_stats_label.setText(f"存储: {size_mb:.1f} MB ({file_count} 个文件)")
+
+    def _update_audio_stats_async(self):
+        """
+        异步更新音频统计信息
+
+        v1.4.2 新增：在后台线程执行，防止阻塞主线程
+        """
+        def update():
+            try:
+                # 在后台线程执行耗时操作
+                total_size = self.audio_manager.get_total_size()
+                file_count = self.audio_manager.get_file_count()
+
+                # 更新缓存
+                self._cached_stats = (total_size, file_count)
+
+                # 使用 Qt 信号更新 UI（线程安全）
+                self._update_stats_signal.emit(total_size, file_count)
+
+                logger.debug(f"音频统计异步更新完成: {file_count} 个文件")
+            except Exception as e:
+                logger.error(f"异步更新音频统计失败: {e}")
+            finally:
+                self._stats_update_pending = False
+
+        # 在后台线程执行
+        import threading
+        thread = threading.Thread(target=update, daemon=True)
+        thread.start()
 
     def _download_marianmt_model(self, direction: str):
         """下载 MarianMT 翻译模型"""
@@ -586,9 +771,37 @@ class SettingsWindow(QWidget):
 
     def load_settings(self):
         """加载配置到 UI"""
-        # 快捷键
-        self.voice_hotkey_input.setText(self.settings.voice_input_hotkey)
-        self.translate_hotkey_input.setText(self.settings.quick_translate_hotkey)
+        # ===== 快捷键配置 (v1.4.2) =====
+        voice_key = self.settings.voice_input_hotkey
+        voice_mode = self.settings.voice_input_mode
+
+        # 设置快捷键下拉框
+        for i in range(self.voice_hotkey_combo.count()):
+            if self.voice_hotkey_combo.itemData(i) == voice_key:
+                self.voice_hotkey_combo.setCurrentIndex(i)
+                break
+
+        # 设置触发模式单选按钮
+        if voice_mode == "double_press":
+            self.voice_mode_double.setChecked(True)
+        else:
+            self.voice_mode_single.setChecked(True)
+
+        # 翻译快捷键
+        translate_key = self.settings.quick_translate_hotkey
+        translate_mode = self.settings.translate_mode
+
+        # 设置快捷键下拉框
+        for i in range(self.translate_hotkey_combo.count()):
+            if self.translate_hotkey_combo.itemData(i) == translate_key:
+                self.translate_hotkey_combo.setCurrentIndex(i)
+                break
+
+        # 设置触发模式单选按钮
+        if translate_mode == "double_press":
+            self.translate_mode_double.setChecked(True)
+        else:
+            self.translate_mode_single.setChecked(True)
 
         # 音频
         self.vad_spinbox.setValue(self.settings.vad_threshold)
@@ -615,33 +828,153 @@ class SettingsWindow(QWidget):
         self._update_model_status()
 
     def save_settings(self):
-        """保存 UI 配置"""
+        """
+        保存 UI 配置
+
+        v1.4.2: 新增快捷键验证机制 + 立即应用设置
+        """
         try:
-            # 快捷键
-            self.settings.voice_input_hotkey = self.voice_hotkey_input.text()
-            self.settings.quick_translate_hotkey = self.translate_hotkey_input.text()
+            # ===== 验证快捷键配置 =====
+            is_valid, error_msg = self._validate_hotkey_config()
+            if not is_valid:
+                QMessageBox.warning(self, "配置错误", f"快捷键配置无效：\n\n{error_msg}")
+                return
+
+            # ===== 检查 typing 模式警告 =====
+            injection_method = self.injection_method_combo.currentData()
+            if injection_method == "typing":
+                reply = QMessageBox.question(
+                    self,
+                    "确认使用 typing 模式",
+                    "⚠️ typing 模式仅支持英文字符输入，无法输入中文。\n\n"
+                    "您确定要使用此模式吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            # ===== 跟踪哪些设置发生了变化 =====
+            changed_settings = {}
+
+            # ===== 保存语音输入配置 =====
+            voice_key = self.voice_hotkey_combo.currentData()
+            voice_mode = "double_press" if self.voice_mode_double.isChecked() else "single_press"
+            old_voice_config = self.settings.get("hotkeys.voice_input", {})
+
+            # 检查快捷键或模式是否改变
+            voice_changed = (
+                isinstance(old_voice_config, dict) and (
+                    old_voice_config.get("key") != voice_key or
+                    old_voice_config.get("mode") != voice_mode
+                )
+            ) or (
+                isinstance(old_voice_config, str) and old_voice_config != voice_key
+            )
+
+            voice_config = {"key": voice_key, "mode": voice_mode}
+            self.settings.set("hotkeys.voice_input", voice_config)
+
+            # ===== 保存翻译配置 =====
+            translate_key = self.translate_hotkey_combo.currentData()
+            translate_mode = "double_press" if self.translate_mode_double.isChecked() else "single_press"
+            old_translate_config = self.settings.get("hotkeys.quick_translate", {})
+
+            # 检查快捷键或模式是否改变
+            translate_changed = (
+                isinstance(old_translate_config, dict) and (
+                    old_translate_config.get("key") != translate_key or
+                    old_translate_config.get("mode") != translate_mode
+                )
+            ) or (
+                isinstance(old_translate_config, str) and old_translate_config != translate_key
+            )
+
+            translate_config = {"key": translate_key, "mode": translate_mode}
+            self.settings.set("hotkeys.quick_translate", translate_config)
+
+            if voice_changed or translate_changed:
+                changed_settings["hotkeys"] = True
 
             # 音频
+            old_vad = self.settings.vad_threshold
             self.settings.vad_threshold = self.vad_spinbox.value()
+            if old_vad != self.settings.vad_threshold:
+                changed_settings["vad_threshold"] = True
 
             # 翻译
+            old_target = self.settings.target_language
             self.settings.target_language = self.target_lang_combo.currentData()
+            if old_target != self.settings.target_language:
+                changed_settings["target_language"] = True
 
             # 音频清理
             self.settings.cleanup_enabled = self.auto_cleanup_checkbox.isChecked()
             self.settings.cleanup_days = self.cleanup_days_spinbox.value()
 
             # 注入方式
-            self.settings.injection_method = self.injection_method_combo.currentData()
+            old_injection = self.settings.injection_method
+            self.settings.injection_method = injection_method
+            if old_injection != self.settings.injection_method:
+                changed_settings["injection_method"] = True
 
             # 保存到文件
             self.settings.save()
 
-            QMessageBox.information(self, "成功", "设置已保存，部分设置需要重启应用后生效")
+            # ===== 应用设置更改（如果提供了回调）=====
+            if self._apply_callback and changed_settings:
+                try:
+                    success = self._apply_callback(changed_settings)
+                    if success:
+                        QMessageBox.information(self, "成功", "设置已保存并已立即生效！")
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "部分成功",
+                            "设置已保存，但部分设置应用失败。\n\n"
+                            "请尝试重启应用以应用所有设置。"
+                        )
+                except Exception as e:
+                    logger.error(f"应用设置回调失败: {e}")
+                    QMessageBox.warning(
+                        self,
+                        "部分成功",
+                        f"设置已保存，但应用设置时出错：{e}\n\n"
+                        "请尝试重启应用以应用所有设置。"
+                    )
+            else:
+                QMessageBox.information(self, "成功", "设置已保存，部分设置需要重启应用后生效")
+
             # 不关闭窗口，用户可以继续修改或手动关闭
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存设置失败: {e}")
+
+    def _validate_hotkey_config(self) -> tuple[bool, str]:
+        """
+        验证快捷键配置
+
+        Returns:
+            (is_valid, error_message)
+        """
+        voice_key = self.voice_hotkey_combo.currentData()
+        translate_key = self.translate_hotkey_combo.currentData()
+
+        # 检查是否使用相同的快捷键
+        if voice_key == translate_key:
+            return False, "语音输入和快速翻译不能使用相同的快捷键"
+
+        # 检查快捷键是否有效
+        presets = HOTKEY_PRESETS["macos"] if IS_MACOS else HOTKEY_PRESETS["windows"]
+        valid_keys = [key for key, _ in presets]
+
+        if voice_key not in valid_keys:
+            return False, f"无效的语音输入快捷键: {voice_key}"
+
+        if translate_key not in valid_keys:
+            return False, f"无效的翻译快捷键: {translate_key}"
+
+        return True, ""
 
 
 class AudioListDialog(QDialog):

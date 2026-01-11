@@ -10,6 +10,7 @@ from .constants import (
     DEFAULT_AUDIO,
     DEFAULT_CLEANUP,
     DEFAULT_HOTKEYS,
+    DEFAULT_HOTKEY_CONFIG,  # v1.4.2 新增
     DEFAULT_TEXT_PROCESSING,
     DEFAULT_TRANSLATION,
     DEFAULT_INJECTION,
@@ -117,19 +118,83 @@ class Settings:
 
     @property
     def voice_input_hotkey(self) -> str:
-        return self.get("hotkeys.voice_input", DEFAULT_HOTKEYS["voice_input"])
+        """获取语音输入快捷键（向后兼容）"""
+        default = DEFAULT_HOTKEY_CONFIG["voice_input"]
+        config = self.get("hotkeys.voice_input", default)
+        if isinstance(config, dict):
+            return config.get("key", default["key"])
+        return config  # 兼容旧格式（字符串）
 
     @voice_input_hotkey.setter
     def voice_input_hotkey(self, value: str):
-        self.set("hotkeys.voice_input", value)
+        """设置语音输入快捷键"""
+        current = self.get("hotkeys.voice_input", DEFAULT_HOTKEY_CONFIG["voice_input"])
+        if isinstance(current, dict):
+            current["key"] = value
+            self.set("hotkeys.voice_input", current)
+        else:
+            # 旧格式，转换为新的字典格式
+            self.set("hotkeys.voice_input", {"key": value, "mode": "single_press"})
+
+    @property
+    def voice_input_mode(self) -> str:
+        """获取语音输入触发模式"""
+        default = DEFAULT_HOTKEY_CONFIG["voice_input"]
+        config = self.get("hotkeys.voice_input", default)
+        if isinstance(config, dict):
+            return config.get("mode", default["mode"])
+        return "single_press"  # 默认一次按键
+
+    @voice_input_mode.setter
+    def voice_input_mode(self, value: str):
+        """设置语音输入触发模式"""
+        current = self.get("hotkeys.voice_input", DEFAULT_HOTKEY_CONFIG["voice_input"])
+        if isinstance(current, dict):
+            current["mode"] = value
+            self.set("hotkeys.voice_input", current)
+        else:
+            # 旧格式，转换为新的字典格式
+            self.set("hotkeys.voice_input", {"key": current, "mode": value})
 
     @property
     def quick_translate_hotkey(self) -> str:
-        return self.get("hotkeys.quick_translate", DEFAULT_HOTKEYS["quick_translate"])
+        """获取翻译快捷键（向后兼容）"""
+        default = DEFAULT_HOTKEY_CONFIG["quick_translate"]
+        config = self.get("hotkeys.quick_translate", default)
+        if isinstance(config, dict):
+            return config.get("key", default["key"])
+        return config  # 兼容旧格式（字符串）
 
     @quick_translate_hotkey.setter
     def quick_translate_hotkey(self, value: str):
-        self.set("hotkeys.quick_translate", value)
+        """设置翻译快捷键"""
+        current = self.get("hotkeys.quick_translate", DEFAULT_HOTKEY_CONFIG["quick_translate"])
+        if isinstance(current, dict):
+            current["key"] = value
+            self.set("hotkeys.quick_translate", current)
+        else:
+            # 旧格式，转换为新的字典格式
+            self.set("hotkeys.quick_translate", {"key": value, "mode": "double_press"})
+
+    @property
+    def translate_mode(self) -> str:
+        """获取翻译触发模式"""
+        default = DEFAULT_HOTKEY_CONFIG["quick_translate"]
+        config = self.get("hotkeys.quick_translate", default)
+        if isinstance(config, dict):
+            return config.get("mode", default["mode"])
+        return "double_press"  # 默认双击+长按
+
+    @translate_mode.setter
+    def translate_mode(self, value: str):
+        """设置翻译触发模式"""
+        current = self.get("hotkeys.quick_translate", DEFAULT_HOTKEY_CONFIG["quick_translate"])
+        if isinstance(current, dict):
+            current["mode"] = value
+            self.set("hotkeys.quick_translate", current)
+        else:
+            # 旧格式，转换为新的字典格式
+            self.set("hotkeys.quick_translate", {"key": current, "mode": value})
 
     # ==================== 音频配置 ====================
 

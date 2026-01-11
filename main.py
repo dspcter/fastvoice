@@ -185,15 +185,31 @@ class FastVoiceApp(QObject):
             force: 是否强制执行（忽略状态检查）
         """
         with self._state_lock:
+            old_state = self._state
+
+            # v1.4.2: 诊断日志
+            logger.info(f"[_finalize_recording] 进入，当前状态: {old_state.value}, force={force}")
+
             if not force and self._state == AppState.IDLE:
+                logger.info(f"[_finalize_recording] 已经是 IDLE，幂等返回")
                 return  # 已经是 IDLE，幂等返回
 
             if self._state not in [AppState.VOICE_RECORDING, AppState.TRANSLATE_RECORDING]:
-                logger.warning(f"当前状态不允许 finalize: {self._state.value}")
-                return
+                logger.warning(f"[_finalize_recording] 当前状态不允许 finalize: {self._state.value}")
+
+                # v1.4.2: 如果是 FINALIZING 状态，可能已经在处理中了，直接返回
+                if self._state == AppState.FINALIZING:
+                    logger.info(f"[_finalize_recording] 已在 FINALIZING 状态，跳过")
+                    return
+
+                # v1.4.2: 强制模式下，尝试继续处理
+                if not force:
+                    return
+
+                # 强制模式：从 FINALIZING 或其他状态继续
+                logger.warning(f"[_finalize_recording] 强制模式，继续处理")
 
             # 转换到 FINALIZING 状态
-            old_state = self._state
             self._state = AppState.FINALIZING
 
         logger.info(f"结束录音，当前状态: {old_state.value}")
@@ -219,6 +235,7 @@ class FastVoiceApp(QObject):
             try:
                 self._current_translate = (old_state == AppState.TRANSLATE_RECORDING)
                 self.asr_worker.process_audio(audio_data)
+                logger.info(f"[_finalize_recording] 已提交 ASR 任务，translate={self._current_translate}")
             except Exception as e:
                 logger.error(f"提交 ASR 任务失败: {e}")
                 # 异常时立即回到 IDLE
@@ -232,6 +249,8 @@ class FastVoiceApp(QObject):
 
         # 最后清理录音采集器（确保状态已处理完毕）
         self._current_audio_capture = None
+
+        logger.info(f"[_finalize_recording] 完成，最终状态: {self._get_state().value}")
 
     def initialize(self):
         """初始化应用"""
@@ -273,14 +292,23 @@ class FastVoiceApp(QObject):
         )
 
         # 启动快捷键监听
+        # v1.4.2: 获取快捷键配置（包含模式）
         voice_hotkey = self.settings.voice_input_hotkey
         translate_hotkey = self.settings.quick_translate_hotkey
+        voice_mode = self.settings.voice_input_mode
+        translate_mode = self.settings.translate_mode
 
-        if not self.hotkey_manager.start(voice_hotkey, translate_hotkey):
+        if not self.hotkey_manager.start(
+            voice_hotkey,
+            translate_hotkey,
+            voice_mode=voice_mode,
+            translate_mode=translate_mode
+        ):
             logger.error("启动快捷键监听失败")
             return False
 
-        logger.info("快捷键监听已启动")
+        logger.info(f"快捷键监听已启动: voice={voice_hotkey}({voice_mode}), "
+                   f"translate={translate_hotkey}({translate_mode})")
         return True
 
     def _warmup_audio_stream(self):
@@ -361,9 +389,16 @@ class FastVoiceApp(QObject):
     def _on_voice_release(self):
         """语音输入按键释放 - 停止录音并识别"""
         try:
-            # 检查状态
+            # v1.4.2: 诊断日志 - 记录当前状态
             current_state = self._get_state()
+            logger.info(f"[_on_voice_release] 当前状态: {current_state.value}")
+
             if current_state != AppState.VOICE_RECORDING:
+                logger.warning(f"[_on_voice_release] 状态不匹配，期望: voice_recording, 实际: {current_state.value}")
+                # v1.4.2: 如果状态不匹配，但有正在进行的录音，仍然尝试停止
+                if self._current_audio_capture and self._current_audio_capture.is_recording():
+                    logger.warning(f"[_on_voice_release] 检测到录音仍在进行，强制停止")
+                    self._finalize_recording(force=True)
                 return
 
             logger.info("停止录音 (语音输入)")
@@ -416,9 +451,16 @@ class FastVoiceApp(QObject):
     def _on_translate_release(self):
         """翻译按键释放 - 停止录音并翻译"""
         try:
-            # 检查状态
+            # v1.4.2: 诊断日志 - 记录当前状态
             current_state = self._get_state()
+            logger.info(f"[_on_translate_release] 当前状态: {current_state.value}")
+
             if current_state != AppState.TRANSLATE_RECORDING:
+                logger.warning(f"[_on_translate_release] 状态不匹配，期望: translate_recording, 实际: {current_state.value}")
+                # v1.4.2: 如果状态不匹配，但有正在进行的录音，仍然尝试停止
+                if self._current_audio_capture and self._current_audio_capture.is_recording():
+                    logger.warning(f"[_on_translate_release] 检测到录音仍在进行，强制停止")
+                    self._finalize_recording(force=True)
                 return
 
             logger.info("停止录音 (翻译)")
@@ -468,7 +510,7 @@ class FastVoiceApp(QObject):
 
         if self.settings_window is None:
             logger.info("创建新的设置窗口")
-            self.settings_window = SettingsWindow()
+            self.settings_window = SettingsWindow(apply_callback=self.apply_settings)
         else:
             logger.info("使用已存在的设置窗口")
 
@@ -477,22 +519,103 @@ class FastVoiceApp(QObject):
         self.settings_window.activateWindow()
         logger.info("=== 设置窗口已显示 ===")
 
+    def apply_settings(self, changed_settings: dict = None) -> bool:
+        """
+        应用设置更改（v1.4.2 新增）
+
+        用于在不重启应用的情况下应用设置更改
+
+        Args:
+            changed_settings: 已更改的设置项字典
+
+        Returns:
+            是否应用成功
+        """
+        if changed_settings is None:
+            changed_settings = {}
+
+        logger.info(f"应用设置更改: {list(changed_settings.keys())}")
+
+        try:
+            # 1. 重新配置快捷键
+            if "hotkeys" in changed_settings:
+                voice_hotkey = self.settings.voice_input_hotkey
+                translate_hotkey = self.settings.quick_translate_hotkey
+                voice_mode = self.settings.voice_input_mode
+                translate_mode = self.settings.translate_mode
+
+                success = self.hotkey_manager.reconfigure(
+                    voice_hotkey,
+                    translate_hotkey,
+                    voice_mode=voice_mode,
+                    translate_mode=translate_mode
+                )
+                if not success:
+                    logger.error("重新配置快捷键失败")
+                    return False
+                logger.info("✓ 快捷键已重新配置")
+
+            # 2. 重新加载注入器
+            if "injection_method" in changed_settings:
+                # 清理旧的注入器
+                if self.text_injector:
+                    try:
+                        self.text_injector.cleanup()
+                    except Exception as e:
+                        logger.warning(f"清理旧注入器时出错: {e}")
+
+                # 创建新注入器
+                new_method = self.settings.injection_method
+                self.text_injector = get_text_injector(method=new_method)
+                logger.info(f"✓ 文字注入方式已更改为: {new_method}")
+
+            # 3. 其他设置可以立即生效
+            # - VAD 阈值：AudioCapture 会在下次录音时使用新值
+            # - 翻译目标语言：翻译引擎会在下次翻译时使用新值
+            # - 自动清理：MemoryManager 会在下次检查时使用新值
+
+            logger.info("✓ 设置已应用")
+            return True
+
+        except Exception as e:
+            logger.error(f"应用设置失败: {e}")
+            return False
+
     def shutdown(self):
         """关闭应用"""
         logger.info("正在关闭应用...")
 
-        # 停止快捷键监听
-        self.hotkey_manager.stop()
+        try:
+            # 停止快捷键监听
+            self.hotkey_manager.stop()
+        except Exception as e:
+            logger.error(f"停止快捷键监听失败: {e}")
 
-        # 停止 ASR Worker
-        self.asr_worker.stop()
+        try:
+            # 停止 ASR Worker
+            self.asr_worker.stop()
+        except Exception as e:
+            logger.error(f"停止 ASR Worker 失败: {e}")
 
-        # 停止内存自动清理
-        self.memory_manager.stop_auto_cleanup()
+        try:
+            # 停止内存自动清理
+            self.memory_manager.stop_auto_cleanup()
+        except Exception as e:
+            logger.error(f"停止内存清理失败: {e}")
 
-        # 停止录音（如果正在录音）
-        if self._current_audio_capture and self._current_audio_capture.is_recording():
-            self._current_audio_capture.stop_recording()
+        try:
+            # 停止录音（如果正在录音）
+            if self._current_audio_capture and self._current_audio_capture.is_recording():
+                self._current_audio_capture.stop_recording()
+        except Exception as e:
+            logger.error(f"停止录音失败: {e}")
+
+        # v1.4.2 新增：清理注入器（防止退出时疯狂注入）
+        try:
+            if self.text_injector:
+                self.text_injector.cleanup()
+        except Exception as e:
+            logger.error(f"清理注入器失败: {e}")
 
         logger.info("应用已关闭")
 
