@@ -694,10 +694,18 @@ class FastVoiceApp(QObject):
 
         P0 线程安全：发射信号到主线程执行
 
+        v1.4.7: 添加关闭检查，防止退出后混乱注入
+
         Args:
             text: 识别出的文本
         """
         try:
+            # v1.4.7: 首先检查应用是否正在关闭
+            with self._shutdown_lock:
+                if self._is_shutting_down:
+                    logger.info("🛑 [ASR回调] 应用正在关闭，忽略 ASR 结果: '%s'", text)
+                    return
+
             if not text:
                 logger.debug("ASR 识别结果为空")
                 # 空结果也要回到 IDLE
@@ -768,9 +776,17 @@ class FastVoiceApp(QObject):
 
         P0: 发射信号到主线程恢复状态
 
+        v1.4.7: 添加关闭检查，防止退出时混乱注入
+
         Args:
             error: 异常对象
         """
+        # v1.4.7: 检查应用是否正在关闭
+        with self._shutdown_lock:
+            if self._is_shutting_down:
+                logger.info("🛑 [ASR错误回调] 应用正在关闭，忽略 ASR 错误")
+                return
+
         logger.error("ASR Worker 错误: %s", error)
 
         # 判断异常类型并给出提示
