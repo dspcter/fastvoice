@@ -1,0 +1,67 @@
+# 快人快语 - .gitignore
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==================== 虚拟环境 ====================
+venv/
+ENV/
+env/
+.venv
+
+# ==================== IDE ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ==================== 模型文件 (大文件) ====================
+models/models/
+*.onnx
+*.gguf
+*.bin
+*.safetensors
+
+# ==================== 音频文件 ====================
+audio/recordings/*.wav
+audio/recordings/*.mp3
+audio/recordings/*.m4a
+
+# ==================== 日志 ====================
+logs/*.log
+
+# ==================== 配置 (用户自定义) ====================
+config/settings.json
+
+# ==================== 打包输出 ====================
+*.spec
+build/
+dist/
+*.app
+*.exe
+
+# ==================== 临时文件 ====================
+*.tmp
+*.temp
+.cache/
