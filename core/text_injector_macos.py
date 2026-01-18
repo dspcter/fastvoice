@@ -466,13 +466,10 @@ class MacOSTextInjector:
             return False
 
         finally:
-            # v1.4.3: 确保剪贴板总是被恢复，无论成功还是失败
+            # v1.4.7: 总是恢复剪贴板，防止退出时剪贴板残留注入文本
             try:
-                if _is_cleaning_up:
-                    logger.debug("🧹 [MacOSInjector] 正在清理，跳过剪贴板恢复")
-                else:
-                    pyperclip.copy(original_clipboard)
-                    logger.debug(f"✓ [MacOSInjector] 剪贴板已恢复")
+                pyperclip.copy(original_clipboard)
+                logger.debug(f"✓ [MacOSInjector] 剪贴板已恢复")
             except Exception as e:
                 logger.error(f"✗ [MacOSInjector] 恢复剪贴板失败: {e}")
 
