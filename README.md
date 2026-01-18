@@ -2,7 +2,7 @@
 
 > 本地优先的 AI 语音输入法 - 毫秒响应，隐私安全
 
-[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/dspcter/fastvoice)
+[![Version](https://img.shields.io/badge/version-1.4.7-blue.svg)](https://github.com/dspcter/fastvoice)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -227,6 +227,22 @@ python3 -c "import cn2an; print(cn2an.transform('幺三八零一二三'))"
 ---
 
 ## 📝 更新日志
+
+### v1.4.7 (2026-01-18)
+
+**🐛 致命 Bug 修复**
+- 🐛 修复 V 键键码错误（0x76 → 0x09）
+- 🐛 修复退出时连续输入 'v' 的问题
+- ✅ 完善注入事件检测逻辑，防止应用监听到自己的 Command+V
+
+**问题说明**
+- 之前使用错误的键码 0x76（F17 键）检测注入事件
+- 导致应用自己的 Command+V 注入没有被正确忽略
+- 监听器接收到注入事件后触发热键回调，造成重复注入
+- 现已修正为正确的 V 键键码 0x09
+
+**影响范围**
+- `core/pyobjc_keyboard_listener.py`
 
 ### v1.4.0 (2026-01-08)
 
