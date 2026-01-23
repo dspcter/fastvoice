@@ -40,6 +40,7 @@ from core import (
     get_text_postprocessor,
     get_marianmt_engine,
 )
+from core.punctuation_restorer import get_punctuation_restorer
 from core.asr_worker import ASRWorker
 from core.memory_manager import get_memory_manager
 from models import get_model_manager, ModelType
@@ -124,6 +125,7 @@ class FastVoiceApp(QObject):
         self.asr_engine = get_asr_engine()
         self.text_injector = get_text_injector(method=self.settings.injection_method)
         self.text_postprocessor = get_text_postprocessor()
+        self.punctuation_restorer = get_punctuation_restorer()  # v1.5.0: 标点恢复器
         self.model_manager = get_model_manager()
 
         # ASR Worker - 异步处理
@@ -740,8 +742,30 @@ class FastVoiceApp(QObject):
 
             logger.info(f"📥 [主线程] 收到 ASR 结果: '{text}'")
 
-            # 文本后处理
-            processed_text = self.text_postprocessor.process(text)
+            # v1.5.0: 标点恢复 → 文本后处理
+            # 根据配置决定是否使用标点恢复模型
+            if self.settings.use_punctuation_model:
+                try:
+                    # 1. 使用 CT-Transformer 模型恢复标点
+                    text_with_punct = self.punctuation_restorer.restore(text)
+                    logger.debug(f"标点恢复: '{text}' → '{text_with_punct}'")
+
+                    # 2. 使用规则处理器做其他清理（空格、大小写等）
+                    processed_text = self.text_postprocessor.process(text_with_punct)
+                    logger.debug(f"规则后处理: '{text_with_punct}' → '{processed_text}'")
+                except Exception as punct_error:
+                    # 根据配置决定是否回退
+                    if self.settings.punctuation_fallback_on_error:
+                        logger.warning(f"标点恢复失败，回退到规则处理: {punct_error}")
+                        processed_text = self.text_postprocessor.process(text)
+                    else:
+                        logger.error(f"标点恢复模型加载失败且未启用回退: {punct_error}")
+                        logger.error("请检查模型路径或在设置中禁用标点恢复功能")
+                        raise RuntimeError("标点恢复失败且未启用回退模式")
+            else:
+                # 禁用标点恢复，仅使用规则处理
+                processed_text = self.text_postprocessor.process(text)
+
             self._last_recognized_text = processed_text
 
             logger.info("ASR 识别结果: %s", text)

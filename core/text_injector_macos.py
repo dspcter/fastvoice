@@ -211,6 +211,11 @@ class MacOSTextInjector:
         logger.info(f"⌨ 模拟组合键: {'+'.join(modifier_names)} + keycode={key_code:#x}")
 
         try:
+            # 计算标志位（用于主键事件）
+            event_flags = 0
+            for _, flag, _ in modifier_keycodes:
+                event_flags |= flag
+
             # 1. 按下所有修饰键
             for mod_keycode, _, mod_name in modifier_keycodes:
                 mod_down = CGEventCreateKeyboardEvent(self._event_source, mod_keycode, True)
@@ -221,16 +226,18 @@ class MacOSTextInjector:
                 logger.info(f"  ⌘ 按下修饰键: {mod_name} (keycode={mod_keycode:#x})")
                 time.sleep(0.01)
 
-            # 2. 按下主键（此时修饰键已按下）
+            # 2. 按下主键（此时修饰键已按下，需要设置标志位）
             key_down = CGEventCreateKeyboardEvent(self._event_source, key_code, True)
+            CGEventSetFlags(key_down, event_flags)  # 设置修饰键标志位
             CGEventPost(kCGSessionEventTap, key_down)
             with self._lock:
                 self._pressed_keys.append((key_code, f"key_{key_code:#x}"))
-            logger.info(f"  ⌨ 按下主键: keycode={key_code:#x}")
+            logger.info(f"  ⌨ 按下主键: keycode={key_code:#x} (flags={event_flags:#x})")
             time.sleep(self._combo_delay)
 
-            # 3. 释放主键
+            # 3. 释放主键（也需要设置标志位）
             key_up = CGEventCreateKeyboardEvent(self._event_source, key_code, False)
+            CGEventSetFlags(key_up, event_flags)  # 设置修饰键标志位
             CGEventPost(kCGSessionEventTap, key_up)
             with self._lock:
                 # 从列表中移除主键
@@ -274,14 +281,17 @@ class MacOSTextInjector:
 
     def cleanup(self) -> None:
         """
-        v1.4.3: 清理按键状态（不发送事件）
+        v1.5.1: 清理按键状态（不发送事件）
 
         在以下情况调用：
         1. 程序退出时
         2. 检测到异常状态时
 
-        关键改进：v1.4.3 不再发送按键事件，防止触发意外的粘贴行为
-        只是清空状态追踪，让系统自然恢复
+        设计原则：
+        - 应用退出后不应有任何按键行为
+        - Event Tap 会在监听器停止时被禁用
+        - 只需清空状态追踪，不发送任何按键事件
+        - 系统会自动恢复按键状态
         """
         global _is_cleaning_up
         _is_cleaning_up = True
@@ -292,16 +302,18 @@ class MacOSTextInjector:
                 _is_cleaning_up = False
                 return
 
-            logger.warning(f"🧹 [MacOSInjector] cleanup: 清空 {len(self._pressed_keys)} 个按键状态（不发送事件）")
+            logger.warning(f"🧹 [MacOSInjector] cleanup: 清空 {len(self._pressed_keys)} 个按键状态追踪（不发送事件）")
 
-            # v1.4.3: 只清空状态，不发送按键事件
-            # 原因：发送 key_up 事件可能触发意外的粘贴行为
-            # 系统会自然地处理按键状态
+            # 只清空状态追踪，不发送任何按键事件
+            # 原因：
+            # 1. 应用已退出或正在退出，不应发送任何事件
+            # 2. Event Tap 已被禁用，不会有事件冲突
+            # 3. 系统会自动恢复按键状态
             pressed_count = len(self._pressed_keys)
             self._pressed_keys = []
 
-        logger.info(f"✓ [MacOSInjector] cleanup 完成：已清空 {pressed_count} 个按键状态")
-        _is_cleaning_up = False
+            logger.info(f"✓ [MacOSInjector] cleanup 完成：已清空 {pressed_count} 个按键状态追踪")
+            _is_cleaning_up = False
 
     def type_text(self, text: str, interval: float = 0.01) -> bool:
         """
@@ -402,8 +414,8 @@ class MacOSTextInjector:
         logger.info(f"   文本内容: '{text[:100]}...' (总长度: {len(text)})")
         logger.info(f"   最大重试次数: {max_retries}")
 
-        # v1.4.3: 在外层保存剪贴板，确保在异常时也能恢复
-        original_clipboard = pyperclip.paste()
+        # v1.5.1: 在外层保存剪贴板，确保在异常时也能恢复
+        original_clipboard = pyperclip.paste() or ""  # 处理 None 的情况
         logger.debug(f"   原剪贴板长度: {len(original_clipboard)}")
 
         try:

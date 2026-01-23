@@ -1,10 +1,18 @@
-# 快人快语 (FastVoice) - 依赖包列表 (v1.4.0)
+# 快人快语 (FastVoice) - 依赖包列表 (v1.5.1)
 
 # 核心依赖
 sounddevice>=0.4.6               # 音频采集
 webrtcvad>=2.0.10                # 语音活动检测 (VAD)
 pyperclip>=1.8.2                 # 剪贴板操作
 PyObjC>=9.0                      # macOS 原生 API (键盘监听和模拟)
+
+# v1.5.0 新增：标点恢复模型
+# CT-Transformer (FunASR/阿里巴巴)
+# 模型大小: 292MB
+# 推理延迟: 0.6-3.5ms
+# 模型路径: external/CT-Transformer-punctuation/cttpunctuator/src/onnx/punc.onnx
+# 安装方式: cd external/CT-Transformer-punctuation && pip install -e .
+# 下载地址: https://hf-mirror.com/lovemefan/ctt_punctuator/resolve/main/cttpunctuator/src/onnx/punc.onnx
 
 # 可选依赖 (后备方案，非 macOS 平台)
 # pyautogui>=0.9.54              # 模拟键盘输入 (仅作为 PyObjC 不可用时的后备方案)

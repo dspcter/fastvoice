@@ -7,7 +7,7 @@ from pathlib import Path
 # ==================== 项目信息 ====================
 APP_NAME = "快人快语"
 APP_NAME_EN = "FastVoice"
-VERSION = "1.4.3"
+VERSION = "1.5.1"
 
 # ==================== 路径配置 ====================
 # 项目根目录
@@ -107,6 +107,10 @@ DEFAULT_CLEANUP = {
 # 文本处理默认配置
 DEFAULT_TEXT_PROCESSING = {
     "use_ai": False,  # 默认不使用 AI，使用简单规则
+    # v1.5.0: 标点恢复配置
+    "use_punctuation_model": True,  # 是否使用 CT-Transformer 模型恢复标点
+    "punctuation_model_path": "external/CT-Transformer-punctuation/cttpunctuator/src/onnx/punc.onnx",  # ONNX 模型路径
+    "fallback_on_error": False,  # 模型失败时是否回退到规则方案（False 则报错）
 }
 
 # 文字注入默认配置

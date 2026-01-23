@@ -675,16 +675,23 @@ class PyObjCKeyboardListener:
 
     def _cleanup_resources(self) -> None:
         """
-        清理资源（防止内存泄漏）
+        清理资源（防止内存泄漏和退出后事件残留）
 
-        v1.3.4 关键改进：
-        - 不再手动调用 CFRelease
-        - PyObjC 会在 Python GC 时自动调用 CFRelease
-        - 手动调用会导致 double-free，因为 PyObjC 也会调用
-        - 只需从 RunLoop 移除 source 并清空引用
+        v1.5.1 关键改进：
+        - 先禁用 Event Tap，防止退出后仍触发事件
+        - 再从 RunLoop 移除 source
+        - 最后清空引用
         """
         try:
-            # 从 Run Loop 移除 Source（防止 RunLoop 持有引用）
+            # 步骤1: 禁用 Event Tap（关键！防止退出后仍触发事件）
+            if self._tap is not None:
+                try:
+                    CGEventTapEnable(self._tap, False)
+                    logger.info("✓ Event Tap 已禁用")
+                except Exception as e:
+                    logger.warning(f"禁用 Event Tap 失败: {e}")
+
+            # 步骤2: 从 Run Loop 移除 Source（防止 RunLoop 持有引用）
             if self._loop_source is not None and self._loop is not None:
                 try:
                     CFRunLoopRemoveSource(
@@ -696,13 +703,12 @@ class PyObjCKeyboardListener:
                 except Exception as e:
                     logger.debug(f"移除 Loop Source 失败: {e}")
 
-            # 清空引用（让 Python GC 清理 PyObjC 对象）
-            # PyObjC 会在 GC 时自动调用 CFRelease
+            # 步骤3: 清空引用（让 Python GC 清理 PyObjC 对象）
             self._loop_source = None
             self._tap = None
             self._loop = None
 
-            logger.debug("资源引用已清空")
+            logger.info("✓ 资源引用已清空")
 
         except Exception as e:
             logger.debug(f"清理资源时出错: {e}")
