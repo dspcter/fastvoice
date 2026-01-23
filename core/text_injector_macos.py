@@ -414,8 +414,8 @@ class MacOSTextInjector:
         logger.info(f"   文本内容: '{text[:100]}...' (总长度: {len(text)})")
         logger.info(f"   最大重试次数: {max_retries}")
 
-        # v1.4.3: 在外层保存剪贴板，确保在异常时也能恢复
-        original_clipboard = pyperclip.paste()
+        # v1.5.1: 在外层保存剪贴板，确保在异常时也能恢复
+        original_clipboard = pyperclip.paste() or ""  # 处理 None 的情况
         logger.debug(f"   原剪贴板长度: {len(original_clipboard)}")
 
         try:
