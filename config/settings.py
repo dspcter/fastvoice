@@ -298,6 +298,34 @@ class Settings:
     def use_ai_text_processing(self, value: bool):
         self.set("text_processing.use_ai", value)
 
+    # v1.5.0: 标点恢复配置
+    @property
+    def use_punctuation_model(self) -> bool:
+        """是否使用 CT-Transformer 模型进行标点恢复"""
+        return self.get("text_processing.use_punctuation_model", DEFAULT_TEXT_PROCESSING["use_punctuation_model"])
+
+    @use_punctuation_model.setter
+    def use_punctuation_model(self, value: bool):
+        self.set("text_processing.use_punctuation_model", value)
+
+    @property
+    def punctuation_model_path(self) -> str:
+        """标点恢复模型路径"""
+        return self.get("text_processing.punctuation_model_path", DEFAULT_TEXT_PROCESSING["punctuation_model_path"])
+
+    @punctuation_model_path.setter
+    def punctuation_model_path(self, value: str):
+        self.set("text_processing.punctuation_model_path", value)
+
+    @property
+    def punctuation_fallback_on_error(self) -> bool:
+        """标点模型失败时是否回退（False 则报错）"""
+        return self.get("text_processing.fallback_on_error", DEFAULT_TEXT_PROCESSING["fallback_on_error"])
+
+    @punctuation_fallback_on_error.setter
+    def punctuation_fallback_on_error(self, value: bool):
+        self.set("text_processing.fallback_on_error", value)
+
     # ==================== 文字注入配置 ====================
 
     @property

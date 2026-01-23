@@ -2,7 +2,7 @@
 
 > 本地优先的 AI 语音输入法 - 毫秒响应，隐私安全
 
-[![Version](https://img.shields.io/badge/version-1.4.7-blue.svg)](https://github.com/dspcter/fastvoice)
+[![Version](https://img.shields.io/badge/version-1.5.1-blue.svg)](https://github.com/dspcter/fastvoice)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -15,6 +15,7 @@
 | 🎤 **语音输入** | 按住快捷键说话，松开即转换为文字 |
 | 🌐 **智能翻译** | 本地离线翻译，支持中英互译 |
 | 🔢 **数字转换** | 智能识别并转换中文数字（幺三八→138、零一二三→0123） |
+| ✨ **标点恢复** | AI 自动添加中文标点（，。？！），准确率 73% |
 | ⚡ **极速响应** | 端侧模型，毫秒级识别速度 |
 | 🔒 **隐私安全** | 音频本地处理，不上传云端 |
 | 🍎 **原生体验** | macOS 原生键盘操作，可靠稳定 |
@@ -47,6 +48,14 @@ cd ai-automation-tools/快人快语
 # 安装依赖
 pip install -r requirements.txt
 
+# 安装标点恢复模型 (v1.5.0 可选)
+cd external/CT-Transformer-punctuation
+pip install -e .
+# 下载 ONNX 模型 (292MB)
+wget https://hf-mirror.com/lovemefan/ctt_punctuator/resolve/main/cttpunctuator/src/onnx/punc.onnx \
+  -O cttpunctuator/src/onnx/punc.onnx
+cd ../..
+
 # 启动程序
 python main.py
 ```
@@ -57,6 +66,18 @@ python main.py
 1. 下载 SenseVoice 语音识别模型 (~700MB)
 2. 打开设置窗口进行初始配置
 3. 引导完成自动创建标记文件
+
+### v1.5.0 标点恢复模型（可选）
+
+如需启用 AI 标点恢复功能：
+1. 进入 `external/CT-Transformer-punctuation/` 目录
+2. 运行 `pip install -e .` 安装 Python 包装
+3. 从 HuggingFace 镜像下载 ONNX 模型：
+   ```bash
+   wget https://hf-mirror.com/lovemefan/ctt_punctuator/resolve/main/cttpunctuator/src/onnx/punc.onnx \
+     -O cttpunctuator/src/onnx/punc.onnx
+   ```
+4. 在设置中启用"使用标点恢复模型"选项
 
 ---
 
@@ -92,16 +113,17 @@ python main.py
 
 ## 🛠️ 技术栈
 
-| 模块 | 技术方案 |
-|------|---------|
-| **语音识别** | sherpa-onnx + SenseVoice-small |
-| **翻译引擎** | MarianMT (离线) / Qwen2.5-1.5B |
-| **数字转换** | cn2an (自定义增强) |
-| **快捷键监听** | PyObjC (macOS 原生) |
-| **音频采集** | sounddevice + webrtcvad |
-| **文字注入** | PyObjC Quartz CGEvent (macOS 原生) |
-| **设置界面** | PyQt6 |
-| **打包工具** | PyInstaller |
+| 模块 | 技术方案 | 说明 |
+|------|---------|------|
+| **语音识别** | sherpa-onnx + SenseVoice-small | 支持中英日韩粤 |
+| **标点恢复** | CT-Transformer (FunASR) | v1.5.0 新增，ONNX 推理 |
+| **翻译引擎** | MarianMT (离线) / Qwen2.5-1.5B | 中英互译 |
+| **数字转换** | cn2an (自定义增强) | 中文数字 → 阿拉伯数字 |
+| **快捷键监听** | PyObjC (macOS 原生) | kCGEventTap |
+| **音频采集** | sounddevice + webrtcvad | VAD 语音活动检测 |
+| **文字注入** | PyObjC Quartz CGEvent | macOS 原生按键模拟 |
+| **设置界面** | PyQt6 | Qt6 框架 |
+| **打包工具** | PyInstaller | 跨平台打包 |
 
 ---
 
@@ -126,14 +148,21 @@ python main.py
 │   ├── translate_engine.py     # Qwen2.5 翻译
 │   ├── text_injector.py        # 文字注入器
 │   ├── text_injector_macos.py  # macOS 原生按键模拟
-│   └── text_postprocessor.py    # 文本后处理 + 数字转换
+│   ├── text_postprocessor.py    # 文本后处理 + 数字转换
+│   └── punctuation_restorer.py  # v1.5.0: 标点恢复器 (CT-Transformer)
 │
 ├── models/                     # 模型管理
 │   ├── __init__.py
 │   ├── model_manager.py        # 模型下载/管理/检测
 │   └── models/                 # 本地模型存储目录
-│       ├── asr/               # 语音识别模型
-│       └── translation/       # 翻译模型
+│       ├── asr/               # 语音识别模型 (SenseVoice-small)
+│       └── translation/       # 翻译模型 (MarianMT)
+│
+├── external/                   # 外部依赖 (第三方库)
+│   └── CT-Transformer-punctuation/  # v1.5.0: 标点恢复模型 (FunASR)
+│       ├── cttpunctuator/     # Python 包装
+│       └── src/onnx/
+│           └── punc.onnx      # 292MB ONNX 模型
 │
 ├── ui/                         # 用户界面
 │   ├── __init__.py
@@ -227,6 +256,52 @@ python3 -c "import cn2an; print(cn2an.transform('幺三八零一二三'))"
 ---
 
 ## 📝 更新日志
+
+### v1.5.1 (2026-01-23)
+
+**🐛 关键 Bug 修复**
+- 🐛 修复快速松开按键输入单独 "V" 的问题（Command+V 标志位缺失）
+- 🐛 修复退出后胡乱注入和剪贴板粘贴的问题（Event Tap 未禁用）
+- ✅ 正确禁用 Event Tap，确保退出后无任何按键行为
+
+**技术改进**
+- 🔧 组合键模拟时正确设置修饰键标志位（`CGEventSetFlags`）
+- 🔧 监听器停止时禁用 Event Tap（`CGEventTapEnable(tap, False)`）
+- 🧹 注入器 cleanup 不发送按键事件，避免冲突
+
+**新增功能**
+- ✨ 智能标点恢复（基于 CT-Transformer ONNX 模型）
+- ✅ 自动为语音识别结果添加中文标点（，。？！）
+- ✅ 准确率约 73%，延迟仅 0.6-3.5ms
+
+**新增模块**
+- 📦 `core/punctuation_restorer.py` - 标点恢复器（CT-Transformer 封装）
+- 📦 `external/CT-Transformer-punctuation/` - 标点恢复模型（292MB ONNX）
+
+**模型信息**
+- CT-Transformer (FunASR/阿里巴巴)
+- 模型大小: 292MB
+- 推理延迟: 0.6-3.5ms (CPU)
+- 支持中英混合
+
+**配置选项**
+```json
+{
+  "text_processing": {
+    "use_punctuation_model": true,
+    "punctuation_model_path": "external/CT-Transformer-punctuation/cttpunctuator/src/onnx/punc.onnx",
+    "fallback_on_error": false
+  }
+}
+```
+
+**影响范围**
+- `core/punctuation_restorer.py` (新增)
+- `core/text_injector_macos.py` (修复)
+- `core/pyobjc_keyboard_listener.py` (修复)
+- `config/constants.py` (新增配置)
+- `config/settings.py` (新增属性)
+- `core/text_postprocessor.py` (移除标点规则)
 
 ### v1.4.7 (2026-01-18)
 
@@ -374,6 +449,7 @@ python3 -c "import cn2an; print(cn2an.transform('幺三八零一二三'))"
 本项目基于以下优秀的开源项目：
 
 - [Sherpa-ONNX](https://github.com/k2-fsa/sherpa-onnx) - 语音识别框架
+- [CT-Transformer](https://github.com/lovemefan/CT-Transformer-punctuation) - 中文标点恢复 (FunASR/阿里巴巴)
 - [Qwen2.5](https://github.com/QwenLM/Qwen2.5) - 通义千问大模型
 - [MarianMT](https://github.com/Helsinki-NLP/MarianMT) - 神经机器翻译
 - [cn2an](https://github.com/Ailln/cn2an) - 中文数字转换工具
